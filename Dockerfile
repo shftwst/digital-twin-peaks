@@ -9,6 +9,7 @@ RUN uv sync --locked --no-dev
 
 FROM build AS test
 COPY tests ./tests
+COPY scripts ./scripts
 RUN uv sync --locked --all-groups
 ENTRYPOINT ["uv", "run"]
 

@@ -255,10 +255,76 @@ services:
     networks: [twin-public, twin-control]
     command: ["python", "-c", "import time; time.sleep(10**9)"]
 
+  webhook-receiver:
+    profiles: [test]
+    build:
+      context: .
+    command:
+      - uvicorn
+      - enterprise_twins.conformance.receiver:create_from_env
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    environment:
+      <<: *common-environment
+      TWINS_RECEIVER_CONTROL_TOKEN: receiver-conformance-local-token
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=1)
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks: [conformance-admin, twin-webhook-egress]
+
+  conformance:
+    profiles: [test]
+    build:
+      context: .
+      target: test
+    environment:
+      IDENTITY_URL: http://identity:8000
+      CRM_URL: http://crm:8000
+      CONTROL_URL: http://control:8000
+      CONTROL_TOKEN: controller-local-token
+      RECEIVER_URL: http://webhook-receiver:8080
+      RECEIVER_TOKEN: receiver-conformance-local-token
+      CONFORMANCE_RUN_ID: inactive
+      ARTIFACT_ROOT: /app/artifacts/platform-contracts/inactive
+    volumes:
+      - ./artifacts:/app/artifacts
+    depends_on:
+      control:
+        condition: service_healthy
+      identity:
+        condition: service_healthy
+      crm:
+        condition: service_healthy
+      webhook-receiver:
+        condition: service_healthy
+    networks: [conformance-admin, twin-control, twin-public]
+    command: ["python", "-c", "import time; time.sleep(10**9)"]
+
+  public-probe:
+    profiles: [test]
+    build:
+      context: .
+    entrypoint: []
+    command: ["sleep", "infinity"]
+    networks: [twin-public]
+
 volumes:
   twin-postgres:
 
 networks:
+  conformance-admin:
+    internal: true
   twin-public: {}
   twin-integration:
     internal: true

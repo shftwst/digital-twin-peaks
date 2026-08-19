@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+command_name="${1:-}"
+case "$command_name" in
+  platform-success|platform-failure|platform-contracts)
+    ;;
+  *)
+    echo "usage: ./scripts/conformance {platform-success|platform-failure|platform-contracts}" >&2
+    exit 2
+    ;;
+esac
+
+artifact_root="artifacts/platform-contracts"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
+run_root="$artifact_root/runs/$run_id"
+latest_pointer="$artifact_root/latest-run.json"
+
+mkdir -p "$artifact_root/runs"
+rm -f "$latest_pointer"
+mkdir "$run_root"
+
+docker compose --profile test up -d --build --wait
+
+driver() {
+  docker compose run --rm \
+    -e "CONFORMANCE_RUN_ID=$run_id" \
+    -e "ARTIFACT_ROOT=/app/$run_root" \
+    conformance python -m enterprise_twins.conformance.platform_contracts "$@"
+}
+
+if [[ "$command_name" == "platform-success" || "$command_name" == "platform-contracts" ]]; then
+  driver success
+fi
+
+if [[ "$command_name" == "platform-contracts" ]]; then
+  crm_container="$(docker compose ps -q crm)"
+  before_id="$(docker inspect --format '{{.Id}}' "$crm_container")"
+  before_started_at="$(docker inspect --format '{{.State.StartedAt}}' "$crm_container")"
+  docker compose restart crm
+  docker compose up -d --wait crm
+  crm_container="$(docker compose ps -q crm)"
+  after_id="$(docker inspect --format '{{.Id}}' "$crm_container")"
+  after_started_at="$(docker inspect --format '{{.State.StartedAt}}' "$crm_container")"
+  driver after-restart \
+    --before-id "$before_id" \
+    --before-started-at "$before_started_at" \
+    --after-id "$after_id" \
+    --after-started-at "$after_started_at"
+fi
+
+if [[ "$command_name" == "platform-failure" || "$command_name" == "platform-contracts" ]]; then
+  driver failure
+fi
+
+if [[ "$command_name" == "platform-contracts" ]]; then
+  uv run python -m enterprise_twins.conformance.platform_contracts network \
+    --artifact-root "$run_root" \
+    --run-id "$run_id"
+fi
+
+driver summarise "$command_name"
+uv run python -m enterprise_twins.conformance.platform_contracts publish \
+  --root "$artifact_root" \
+  --artifact-root "$run_root" \
+  --run-id "$run_id"
+
+echo "$run_root"

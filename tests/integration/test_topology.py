@@ -42,6 +42,9 @@ def test_only_business_apis_are_published() -> None:
         "event-relay-admin",
         "identity-admin",
         "crm-admin",
+        "webhook-receiver",
+        "conformance",
+        "public-probe",
     ):
         container = subprocess.run(  # noqa: S603
             [docker, "compose", "ps", "-q", service],
@@ -78,6 +81,9 @@ def test_service_network_membership_matches_the_platform_boundary() -> None:
         "crm-admin": {"twin-control"},
         "postgres": {"twin-control", "twin-integration"},
         "test-runner": {"twin-control", "twin-public"},
+        "webhook-receiver": {"conformance-admin", "twin-webhook-egress"},
+        "conformance": {"conformance-admin", "twin-control", "twin-public"},
+        "public-probe": {"twin-public"},
     }
 
     assert {
