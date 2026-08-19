@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_twins.common.control.client import ControlClient
@@ -26,11 +27,16 @@ class RelayStatus:
             return state
 
     async def current_epoch(self) -> str:
-        return (await self.state()).active_epoch
+        try:
+            return (await self.state()).active_epoch
+        except OSError, RuntimeError, SQLAlchemyError:
+            return "none"
 
     async def readiness(self) -> tuple[bool, dict[str, str]]:
         try:
             state = await self.state()
+        except OSError, SQLAlchemyError:
+            return False, {"database": "not_ready", "scenario": "unavailable"}
         except RuntimeError:
             return False, {"database": "not_ready", "scenario": "uninitialised"}
         return state.mode == "active", {"database": "ready", "scenario": state.mode}

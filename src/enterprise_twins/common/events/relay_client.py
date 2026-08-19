@@ -9,9 +9,21 @@ from enterprise_twins.common.events.contracts import (
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 
 
-def require_relay_success(response: httpx.Response) -> None:
-    if response.status_code < 400:
+def require_relay_success(
+    response: httpx.Response,
+    expected_statuses: set[int] | None = None,
+) -> None:
+    accepted = expected_statuses or set(range(200, 300))
+    if response.status_code in accepted:
         return
+    if response.status_code < 400:
+        raise ApiError(
+            ErrorCode.TEMPORARILY_UNAVAILABLE,
+            "event relay returned an unexpected success status",
+            status_code=503,
+            retryable=True,
+            details={"relayStatus": response.status_code},
+        )
     try:
         error = response.json()["error"]
         code = ErrorCode(error["code"])
@@ -46,7 +58,7 @@ class RelayClient:
             json=event.model_dump(mode="json", by_alias=True),
             timeout=2.0,
         )
-        require_relay_success(response)
+        require_relay_success(response, {202})
 
     async def create_subscription(
         self,
@@ -60,7 +72,7 @@ class RelayClient:
             json=request.model_dump(mode="json", by_alias=True),
             timeout=2.0,
         )
-        require_relay_success(response)
+        require_relay_success(response, {201})
         return WebhookSubscriptionCreated.model_validate(response.json())
 
     async def list_subscriptions(self) -> list[WebhookSubscriptionView]:
@@ -69,7 +81,7 @@ class RelayClient:
             headers=self.headers,
             timeout=2.0,
         )
-        require_relay_success(response)
+        require_relay_success(response, {200})
         return [WebhookSubscriptionView.model_validate(item) for item in response.json()]
 
     async def delete_subscription(
@@ -89,4 +101,4 @@ class RelayClient:
             },
             timeout=2.0,
         )
-        require_relay_success(response)
+        require_relay_success(response, {204})

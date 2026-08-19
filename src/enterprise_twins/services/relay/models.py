@@ -44,6 +44,8 @@ class Delivery(ScenarioOwned, Base):
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime] = mapped_column(Timestamp, index=True)
     lease_until: Mapped[datetime | None] = mapped_column(Timestamp, index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64), index=True)
+    current_attempt_id: Mapped[str | None] = mapped_column(String(64), index=True)
     last_status: Mapped[int | None] = mapped_column(Integer)
 
 
@@ -52,6 +54,9 @@ class DeliveryAttempt(ScenarioOwned, Base):
 
     attempt_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     delivery_id: Mapped[str] = mapped_column(String(64), index=True)
+    attempt_number: Mapped[int] = mapped_column(Integer)
+    lease_token: Mapped[str] = mapped_column(String(64), index=True)
     attempted_at: Mapped[datetime] = mapped_column(Timestamp)
     response_status: Mapped[int | None] = mapped_column(Integer)
     outcome: Mapped[str] = mapped_column(String(40))
+    resulting_next_attempt_at: Mapped[datetime | None] = mapped_column(Timestamp)

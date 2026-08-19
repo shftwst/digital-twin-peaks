@@ -1,8 +1,11 @@
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 from pydantic import AnyHttpUrl
 from sqlalchemy import or_, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_twins.common.canonical import sha256_hex
@@ -105,13 +108,9 @@ class RelayRepository:
         digest = sha256_hex(body)
         async with self.factory.begin() as session:
             epoch = await self.active_epoch(session)
-            existing = await session.get(SourceEvent, event.event_id)
-            if existing is not None:
-                if existing.body_hash != digest:
-                    raise ValueError("event ID was reused with changed data")
-                return False
-            session.add(
-                SourceEvent(
+            inserted = await session.scalar(
+                insert(SourceEvent)
+                .values(
                     event_id=event.event_id,
                     scenario_epoch=epoch,
                     source=event.source,
@@ -119,7 +118,20 @@ class RelayRepository:
                     body_hash=digest,
                     envelope=body,
                 )
+                .on_conflict_do_nothing(index_elements=[SourceEvent.event_id])
+                .returning(SourceEvent.event_id)
             )
+            if inserted is None:
+                existing = await session.get(SourceEvent, event.event_id)
+                if existing is None:
+                    raise RuntimeError("conflicting source event is missing")
+                if existing.body_hash != digest:
+                    raise ApiError(
+                        ErrorCode.CONFLICT,
+                        "event ID was reused with changed data",
+                        status_code=409,
+                    )
+                return False
             subscriptions = await session.scalars(
                 select(Subscription).where(
                     Subscription.scenario_epoch == epoch,
@@ -222,7 +234,14 @@ class RelayRepository:
         now: datetime,
     ) -> tuple[Delivery, Subscription, SourceEvent] | None:
         async with self.factory.begin() as session:
-            epoch = await self.active_epoch(session)
+            state = await session.scalar(
+                select(ScenarioState)
+                .where(ScenarioState.singleton_id == 1)
+                .with_for_update(read=True)
+            )
+            if state is None or state.mode != "active":
+                raise RuntimeError("relay scenario is not active")
+            epoch = state.active_epoch
             delivery = await session.scalar(
                 select(Delivery)
                 .where(
@@ -248,41 +267,74 @@ class RelayRepository:
             event = await session.get(SourceEvent, delivery.event_id)
             if subscription is None or event is None:
                 raise RuntimeError("delivery source records are missing")
+            if delivery.state == "in_flight" and delivery.current_attempt_id is not None:
+                uncertain = await session.get(DeliveryAttempt, delivery.current_attempt_id)
+                if uncertain is not None and uncertain.outcome == "in_flight":
+                    uncertain.outcome = "uncertain"
+                    uncertain.resulting_next_attempt_at = now
+            lease_token = new_id("lease")
+            attempt_id = new_id("att")
             delivery.state = "in_flight"
             delivery.attempt_count += 1
             delivery.lease_until = now + timedelta(seconds=30)
+            delivery.lease_token = lease_token
+            delivery.current_attempt_id = attempt_id
+            session.add(
+                DeliveryAttempt(
+                    attempt_id=attempt_id,
+                    scenario_epoch=delivery.scenario_epoch,
+                    delivery_id=delivery.delivery_id,
+                    attempt_number=delivery.attempt_count,
+                    lease_token=lease_token,
+                    attempted_at=now,
+                    response_status=None,
+                    outcome="in_flight",
+                    resulting_next_attempt_at=None,
+                )
+            )
             return delivery, subscription, event
 
     async def finish_attempt(
         self,
         delivery_id: str,
+        lease_token: str,
         attempted_at: datetime,
         response_status: int | None,
         transport_error: str | None,
-    ) -> None:
+    ) -> bool:
         async with self.factory.begin() as session:
-            delivery = await session.get(Delivery, delivery_id, with_for_update=True)
-            if delivery is None:
-                raise RuntimeError("delivery is missing")
-            success = response_status is not None and 200 <= response_status < 300
-            session.add(
-                DeliveryAttempt(
-                    attempt_id=new_id("att"),
-                    scenario_epoch=delivery.scenario_epoch,
-                    delivery_id=delivery.delivery_id,
-                    attempted_at=attempted_at,
-                    response_status=response_status,
-                    outcome="acknowledged" if success else transport_error or "http_failure",
+            delivery = await session.scalar(
+                select(Delivery)
+                .where(
+                    Delivery.delivery_id == delivery_id,
+                    Delivery.state == "in_flight",
+                    Delivery.lease_token == lease_token,
                 )
+                .with_for_update()
             )
+            if delivery is None:
+                return False
+            if delivery.current_attempt_id is None:
+                raise RuntimeError("delivery attempt is missing")
+            attempt = await session.get(DeliveryAttempt, delivery.current_attempt_id)
+            if attempt is None or attempt.lease_token != lease_token:
+                raise RuntimeError("delivery attempt is missing")
+            success = response_status is not None and 200 <= response_status < 300
+            attempt.response_status = response_status
+            attempt.outcome = "acknowledged" if success else transport_error or "http_failure"
             delivery.last_status = response_status
             delivery.lease_until = None
+            delivery.lease_token = None
+            delivery.current_attempt_id = None
             if success:
                 delivery.state = "delivered"
-            elif delivery.state != "delivered":
+                attempt.resulting_next_attempt_at = None
+            else:
                 delivery.state = "pending"
                 delay = min(2**delivery.attempt_count, 300)
                 delivery.next_attempt_at = attempted_at + timedelta(seconds=delay)
+                attempt.resulting_next_attempt_at = delivery.next_attempt_at
+            return True
 
     async def apply_delivery_fault(
         self,
@@ -293,35 +345,70 @@ class RelayRepository:
         if decision.effect == FaultEffect.DUPLICATE:
             return False
         async with self.factory.begin() as session:
-            current = await session.get(Delivery, delivery.delivery_id, with_for_update=True)
+            current = await session.scalar(
+                select(Delivery)
+                .where(
+                    Delivery.delivery_id == delivery.delivery_id,
+                    Delivery.state == "in_flight",
+                    Delivery.lease_token == delivery.lease_token,
+                )
+                .with_for_update()
+            )
             if current is None:
-                raise RuntimeError("delivery is missing")
-            current.lease_until = None
+                return True
+            if current.current_attempt_id is None:
+                raise RuntimeError("delivery attempt is missing")
+            attempt = await session.get(DeliveryAttempt, current.current_attempt_id)
+            if attempt is None:
+                raise RuntimeError("delivery attempt is missing")
             if decision.effect == FaultEffect.DELAY:
                 current.state = "pending"
                 current.next_attempt_at = now + timedelta(milliseconds=decision.delay_ms or 1)
+                resulting_next_attempt_at = current.next_attempt_at
                 outcome = "injected_delay"
             elif decision.effect == FaultEffect.SUPPRESS:
                 current.state = "suppressed"
+                resulting_next_attempt_at = None
                 outcome = "injected_suppress"
             elif decision.effect == FaultEffect.RETRY:
                 current.state = "pending"
                 current.next_attempt_at = now + timedelta(seconds=1)
+                resulting_next_attempt_at = current.next_attempt_at
                 outcome = "injected_retry"
             elif decision.effect == FaultEffect.REORDER:
                 current.state = "pending"
                 current.next_attempt_at = now + timedelta(seconds=2)
+                resulting_next_attempt_at = current.next_attempt_at
                 outcome = "injected_reorder"
             else:
                 return False
-            session.add(
-                DeliveryAttempt(
-                    attempt_id=new_id("att"),
-                    scenario_epoch=current.scenario_epoch,
-                    delivery_id=current.delivery_id,
-                    attempted_at=now,
-                    response_status=None,
-                    outcome=outcome,
-                )
-            )
+            attempt.outcome = outcome
+            attempt.resulting_next_attempt_at = resulting_next_attempt_at
+            current.lease_until = None
+            current.lease_token = None
+            current.current_attempt_id = None
         return True
+
+    @asynccontextmanager
+    async def delivery_fence(
+        self,
+        delivery: Delivery,
+        control_epoch: str,
+    ) -> AsyncIterator[bool]:
+        async with self.factory.begin() as session:
+            state = await session.scalar(
+                select(ScenarioState)
+                .where(ScenarioState.singleton_id == 1)
+                .with_for_update(read=True)
+            )
+            current = await session.get(Delivery, delivery.delivery_id)
+            allowed = (
+                state is not None
+                and state.mode == "active"
+                and state.active_epoch == delivery.scenario_epoch
+                and control_epoch == delivery.scenario_epoch
+                and current is not None
+                and current.state == "in_flight"
+                and current.lease_token == delivery.lease_token
+            )
+            yield allowed

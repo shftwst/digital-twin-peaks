@@ -1,7 +1,7 @@
 import hmac
 from typing import Annotated
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, Path
 
 from enterprise_twins.common.control.client import ControlClient
 from enterprise_twins.common.events.contracts import (
@@ -34,10 +34,12 @@ def relay_router(
 
     @router.post("/sources/{source}/subscriptions", status_code=201)
     async def create_subscription(
-        source: str,
+        source: Annotated[str, Path(min_length=1, max_length=80)],
         body: WebhookSubscriptionCreate,
-        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
-        caller_id: Annotated[str, Header(alias="X-Caller-Id")],
+        idempotency_key: Annotated[
+            str, Header(alias="Idempotency-Key", min_length=1, max_length=200)
+        ],
+        caller_id: Annotated[str, Header(alias="X-Caller-Id", min_length=1, max_length=128)],
         authorization: Annotated[str | None, Header()] = None,
     ) -> WebhookSubscriptionCreated:
         authorise(source, authorization)
@@ -54,7 +56,7 @@ def relay_router(
 
     @router.get("/sources/{source}/subscriptions")
     async def list_subscriptions(
-        source: str,
+        source: Annotated[str, Path(min_length=1, max_length=80)],
         authorization: Annotated[str | None, Header()] = None,
     ) -> list[WebhookSubscriptionView]:
         authorise(source, authorization)
@@ -62,16 +64,20 @@ def relay_router(
 
     @router.delete("/sources/{source}/subscriptions/{subscription_id}", status_code=204)
     async def delete_subscription(
-        source: str,
-        subscription_id: str,
-        if_match: Annotated[str, Header(alias="If-Match")],
-        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
-        caller_id: Annotated[str, Header(alias="X-Caller-Id")],
+        source: Annotated[str, Path(min_length=1, max_length=80)],
+        subscription_id: Annotated[str, Path(min_length=1, max_length=64)],
+        if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=20)],
+        idempotency_key: Annotated[
+            str, Header(alias="Idempotency-Key", min_length=1, max_length=200)
+        ],
+        caller_id: Annotated[str, Header(alias="X-Caller-Id", min_length=1, max_length=128)],
         authorization: Annotated[str | None, Header()] = None,
     ) -> None:
         authorise(source, authorization)
         try:
             expected_version = int(if_match.strip('"'))
+            if expected_version < 1:
+                raise ValueError
         except ValueError as error:
             raise ApiError(
                 ErrorCode.INVALID_REQUEST, "If-Match is invalid", status_code=422
