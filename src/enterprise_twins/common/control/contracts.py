@@ -1,4 +1,6 @@
 from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -22,3 +24,71 @@ class SetClockRequest(BaseModel):
 
 class AdvanceClockRequest(BaseModel):
     duration: str
+
+
+class FaultPhase(StrEnum):
+    BEFORE_VALIDATION = "before_validation"
+    BEFORE_COMMIT = "before_commit"
+    AFTER_COMMIT = "after_commit"
+    READ = "read"
+    EVENT_DELIVERY = "event_delivery"
+    DOMAIN_COMPLETION = "domain_completion"
+
+
+class FaultEffect(StrEnum):
+    MALFORMED_TRANSPORT = "malformed_transport"
+    UNAUTHENTICATED = "unauthenticated"
+    RATE_LIMITED = "rate_limited"
+    TEMPORARY_FAILURE = "temporary_failure"
+    DELAY = "delay"
+    TIMEOUT = "timeout"
+    CONNECTION_LOSS = "connection_loss"
+    MALFORMED_RESPONSE = "malformed_response"
+    STALE_VERSION = "stale_version"
+    TEMPORARY_ABSENCE = "temporary_absence"
+    PAGINATION_CHANGE = "pagination_change"
+    DUPLICATE = "duplicate"
+    REORDER = "reorder"
+    SUPPRESS = "suppress"
+    RETRY = "retry"
+    FAILED_REFUND = "failed_refund"
+    DELAYED_SETTLEMENT = "delayed_settlement"
+    BOUNCE = "bounce"
+    DEFER = "defer"
+    DROP = "drop"
+
+
+class FaultRuleCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    rule_id: str = Field(alias="ruleId")
+    target_service: str = Field(alias="targetService")
+    operation: str
+    phase: FaultPhase
+    effect: FaultEffect
+    actor_id: str | None = Field(default=None, alias="actorId")
+    resource_id: str | None = Field(default=None, alias="resourceId")
+    correlation_id: str | None = Field(default=None, alias="correlationId")
+    request_hash: str | None = Field(default=None, alias="requestHash")
+    occurrence: int = Field(default=1, ge=1)
+    activation_count: int = Field(default=1, ge=1, alias="activationCount")
+    delay_ms: int | None = Field(default=None, ge=0, alias="delayMs")
+    response_data: dict[str, Any] = Field(default_factory=dict, alias="responseData")
+
+
+class FaultProbe(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    target_service: str = Field(alias="targetService")
+    operation: str
+    phase: FaultPhase
+    actor_id: str | None = Field(default=None, alias="actorId")
+    resource_id: str | None = Field(default=None, alias="resourceId")
+    correlation_id: str | None = Field(default=None, alias="correlationId")
+    request_hash: str | None = Field(default=None, alias="requestHash")
+
+
+class FaultDecision(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    rule_id: str | None = Field(default=None, alias="ruleId")
+    effect: FaultEffect | None = None
+    delay_ms: int | None = Field(default=None, alias="delayMs")
+    response_data: dict[str, Any] = Field(default_factory=dict, alias="responseData")
