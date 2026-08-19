@@ -251,6 +251,110 @@ async def test_outbox_is_published_only_after_exact_202_acceptance(
     assert record.publish_attempts == 1
 
 
+@pytest.mark.asyncio
+async def test_relay_client_transport_failures_are_generic_and_retryable() -> None:
+    async def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("transport leaked source-secret", request=request)
+
+    request = WebhookSubscriptionCreate(
+        eventTypes=["crm.note.created"],
+        targetUrl="http://webhook-receiver/events",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(unavailable)) as client:
+        relay = RelayClient("http://relay", "crm", "source-secret", client)
+        operations = (
+            lambda: relay.ingest(source_event()),
+            lambda: relay.create_subscription("person-1", "idem-1", request),
+            relay.list_subscriptions,
+            lambda: relay.delete_subscription("person-1", "idem-2", "sub_1", 1),
+        )
+        for operation in operations:
+            with pytest.raises(ApiError) as raised:
+                await operation()
+            assert raised.value.code == ErrorCode.TEMPORARILY_UNAVAILABLE
+            assert raised.value.status_code == 503
+            assert raised.value.retryable is True
+            assert raised.value.message == "event relay is temporarily unavailable"
+            assert raised.value.details == {}
+            assert "source-secret" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "failure"),
+    [
+        ("create", "json"),
+        ("create", "model"),
+        ("list", "json"),
+        ("list", "model"),
+    ],
+)
+async def test_relay_client_malformed_successes_are_generic_and_retryable(
+    operation: str,
+    failure: str,
+) -> None:
+    async def malformed(_request: httpx.Request) -> httpx.Response:
+        status = 201 if operation == "create" else 200
+        if failure == "json":
+            return httpx.Response(status, content=b'{"secret":"upstream-secret"')
+        body: object
+        if operation == "create":
+            body = {"secret": "upstream-secret"}
+        else:
+            body = [{"source": "crm", "secret": "upstream-secret"}]
+        return httpx.Response(status, json=body)
+
+    request = WebhookSubscriptionCreate(
+        eventTypes=["crm.note.created"],
+        targetUrl="http://webhook-receiver/events",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(malformed)) as client:
+        relay = RelayClient("http://relay", "crm", "source-secret", client)
+        with pytest.raises(ApiError) as raised:
+            if operation == "create":
+                await relay.create_subscription("person-1", "idem-1", request)
+            else:
+                await relay.list_subscriptions()
+
+    assert raised.value.code == ErrorCode.TEMPORARILY_UNAVAILABLE
+    assert raised.value.status_code == 503
+    assert raised.value.retryable is True
+    assert raised.value.message == "event relay is temporarily unavailable"
+    assert raised.value.details == {}
+    assert "upstream-secret" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_relay_client_preserves_explicit_relay_api_errors() -> None:
+    async def conflict(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "error": {
+                    "code": "conflict",
+                    "message": "subscription request conflicts",
+                    "retryable": False,
+                    "details": {"operation": "identity.subscription.create"},
+                }
+            },
+        )
+
+    request = WebhookSubscriptionCreate(
+        eventTypes=["crm.note.created"],
+        targetUrl="http://webhook-receiver/events",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(conflict)) as client:
+        relay = RelayClient("http://relay", "crm", "source-secret", client)
+        with pytest.raises(ApiError) as raised:
+            await relay.create_subscription("person-1", "idem-1", request)
+
+    assert raised.value.code == ErrorCode.CONFLICT
+    assert raised.value.status_code == 409
+    assert raised.value.message == "subscription request conflicts"
+    assert raised.value.retryable is False
+    assert raised.value.details == {"operation": "identity.subscription.create"}
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

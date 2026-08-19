@@ -1,7 +1,7 @@
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from math import isfinite
-from typing import Annotated, Any, Protocol
+from typing import Annotated, Any, Protocol, cast
 
 import httpx
 import jwt
@@ -9,6 +9,9 @@ from fastapi import Depends, Header
 
 from enterprise_twins.common.auth.claims import Principal
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
+
+MIN_NUMERIC_DATE = -62_135_596_800
+MAX_NUMERIC_DATE_EXCLUSIVE = 253_402_300_800
 
 
 class TokenClock(Protocol):
@@ -41,10 +44,12 @@ class JwtVerifier:
         body = response.json()
         if not isinstance(body, dict) or not isinstance(body.get("keys"), list):
             raise ValueError("JWKS response is invalid")
+        if not body["keys"]:
+            raise ValueError("JWKS response is empty")
         keys: dict[str, jwt.PyJWK] = {}
         for item in body["keys"]:
             if not isinstance(item, dict) or not self.is_trusted_jwk(item):
-                continue
+                raise ValueError("JWKS contains an untrusted key")
             kid = item["kid"]
             if kid in keys:
                 raise ValueError("JWKS contains duplicate key IDs")
@@ -62,17 +67,19 @@ class JwtVerifier:
             and bool(item["kid"])
             and isinstance(item.get("x"), str)
             and bool(item["x"])
+            and "d" not in item
         )
 
     @staticmethod
-    def numeric_date(claims: dict[str, Any], name: str) -> float:
+    def numeric_date(claims: dict[str, Any], name: str) -> int | float:
         value = claims[name]
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise jwt.InvalidTokenError(f"{name} must be a numeric date")
-        numeric = float(value)
-        if not isfinite(numeric):
+        if isinstance(value, float) and not isfinite(value):
             raise jwt.InvalidTokenError(f"{name} must be finite")
-        return numeric
+        if not MIN_NUMERIC_DATE <= value < MAX_NUMERIC_DATE_EXCLUSIVE:
+            raise jwt.InvalidTokenError(f"{name} is outside the supported date range")
+        return cast(int | float, value)
 
     @staticmethod
     def required_text(claims: dict[str, Any], name: str) -> str:
@@ -136,6 +143,7 @@ class JwtVerifier:
             token_id = self.required_text(claims, "jti")
         except (
             KeyError,
+            OverflowError,
             TypeError,
             ValueError,
             httpx.HTTPError,

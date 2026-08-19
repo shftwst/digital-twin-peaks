@@ -133,6 +133,7 @@ async def test_unknown_key_refreshes_once_then_uses_the_cached_ed25519_key() -> 
         {"aud": "wrong-audience"},
         {"exp": int(NOW.timestamp())},
         {"exp": float("nan")},
+        {"exp": 10**1000},
         {"nbf": int(NOW.timestamp()) + 1},
         {"nbf": NOW.timestamp() + 0.5},
         {"iat": int(NOW.timestamp()) + 1},
@@ -247,3 +248,68 @@ async def test_unknown_key_id_is_denied_after_refresh_without_leaking_it() -> No
 
     assert raised.value.code == ErrorCode.UNAUTHENTICATED
     assert "unknown-sensitive-key" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_jwks_refresh_rejects_mixed_sets_without_replacing_cached_keys() -> None:
+    cached_private, cached_jwk = signing_material(kid="cached-key")
+    new_private, new_jwk = signing_material(kid="new-key")
+    malformed_jwk = {"kty": "OKP", "kid": "malformed-sensitive-key"}
+
+    async def jwks(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"keys": [new_jwk, malformed_jwk]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(jwks)) as client:
+        verifier = JwtVerifier(
+            "http://identity:8000",
+            "enterprise-twins",
+            "http://identity:8000/.well-known/jwks.json",
+            Clock(),
+            client,
+        )
+        cached_key = jwt.PyJWK.from_dict(cached_jwk, algorithm="EdDSA")
+        verifier.keys["cached-key"] = cached_key
+        with pytest.raises(ApiError) as raised:
+            await verifier.verify(token(new_private, kid="new-key"))
+        cached = await verifier.verify(token(cached_private, kid="cached-key"))
+
+    assert raised.value.code == ErrorCode.UNAUTHENTICATED
+    assert raised.value.message == "bearer token is invalid"
+    assert verifier.keys == {"cached-key": cached_key}
+    assert cached.subject == "person-1"
+    assert "malformed-sensitive-key" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_jwks_refresh_rejects_private_keys_without_replacing_cached_keys() -> None:
+    cached_private, cached_jwk = signing_material(kid="cached-key")
+    new_private, new_jwk = signing_material(kid="private-key")
+    private_value = new_private.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    )
+    private_jwk = new_jwk | {"d": b64url(private_value)}
+
+    async def jwks(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"keys": [private_jwk]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(jwks)) as client:
+        verifier = JwtVerifier(
+            "http://identity:8000",
+            "enterprise-twins",
+            "http://identity:8000/.well-known/jwks.json",
+            Clock(),
+            client,
+        )
+        cached_key = jwt.PyJWK.from_dict(cached_jwk, algorithm="EdDSA")
+        verifier.keys["cached-key"] = cached_key
+        with pytest.raises(ApiError) as raised:
+            await verifier.verify(token(new_private, kid="private-key"))
+        cached = await verifier.verify(token(cached_private, kid="cached-key"))
+
+    assert raised.value.code == ErrorCode.UNAUTHENTICATED
+    assert raised.value.message == "bearer token is invalid"
+    assert verifier.keys == {"cached-key": cached_key}
+    assert cached.subject == "person-1"
+    assert b64url(private_value) not in str(raised.value)
