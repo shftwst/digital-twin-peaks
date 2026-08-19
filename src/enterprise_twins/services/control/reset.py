@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, Protocol
+from typing import Annotated, Any, Literal, Protocol
 
 import httpx
 from fastapi import APIRouter, Depends
@@ -22,6 +22,7 @@ from enterprise_twins.common.control.contracts import (
     ResetResult,
 )
 from enterprise_twins.common.db.records import ScenarioState
+from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.common.ids import new_id
 from enterprise_twins.services.control.models import (
     FaultActivation,
@@ -62,6 +63,9 @@ class ParticipantClient(Protocol):
     async def commit(self, epoch: str) -> None:
         raise NotImplementedError
 
+    async def finalize(self, epoch: str) -> None:
+        raise NotImplementedError
+
     async def abort(self, epoch: str) -> None:
         raise NotImplementedError
 
@@ -69,7 +73,13 @@ class ParticipantClient(Protocol):
 BundleLoader = Callable[[str, int], ScenarioBundle]
 BeginControl = Callable[[str, ScenarioBundle, int], Awaitable[None]]
 CommitControl = Callable[[str, ScenarioBundle, int], Awaitable[None]]
-FailControl = Callable[[str], Awaitable[None]]
+FinalizeControl = Callable[[str], Awaitable[None]]
+ResetFailurePhase = Literal["pre_cutover", "cleanup"]
+FailControl = Callable[[str, ResetFailurePhase], Awaitable[None]]
+
+
+class ResetCleanupError(RuntimeError):
+    pass
 
 
 class ResetCoordinator:
@@ -80,12 +90,14 @@ class ResetCoordinator:
         begin_control: BeginControl,
         commit_control: CommitControl,
         fail_control: FailControl,
+        finalize_control: FinalizeControl,
     ) -> None:
         self.participants = participants
         self.load_bundle = load_bundle
         self.begin_control = begin_control
         self.commit_control = commit_control
         self.fail_control = fail_control
+        self.finalize_control = finalize_control
         self.lock = asyncio.Lock()
         self.test_mode = "active"
 
@@ -99,14 +111,19 @@ class ResetCoordinator:
         async def commit(_epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
             return None
 
-        async def fail(_epoch: str) -> None:
+        async def fail(_epoch: str, _phase: ResetFailurePhase) -> None:
             return None
 
-        return cls(participants, lambda _sid, _version: bundle, begin, commit, fail)
+        async def finalize(_epoch: str) -> None:
+            return None
+
+        return cls(participants, lambda _sid, _version: bundle, begin, commit, fail, finalize)
 
     async def reset(self, request: ResetRequest) -> ResetResult:
         async with self.lock:
             bundle = self.load_bundle(request.scenario_id, request.version)
+            if set(self.participants) != set(bundle.payloads):
+                raise ValueError("participant services differ from scenario bundle services")
             seed = (
                 request.random_seed
                 if request.random_seed is not None
@@ -129,6 +146,7 @@ class ResetCoordinator:
                             randomSeed=seed,
                             payload=payload,
                             checksum=checksum,
+                            manifestChecksum=bundle.checksum,
                         )
                     )
                     if (
@@ -141,15 +159,32 @@ class ResetCoordinator:
                 for participant in self.participants.values():
                     await participant.commit(epoch)
                 await self.commit_control(epoch, bundle, seed)
-                self.test_mode = "active"
             except Exception:
                 await asyncio.gather(
                     *(participant.abort(epoch) for participant in self.participants.values()),
                     return_exceptions=True,
                 )
-                await self.fail_control(epoch)
+                await self.fail_control(epoch, "pre_cutover")
                 self.test_mode = "error"
                 raise
+            try:
+                cleanup_results = await asyncio.gather(
+                    *(participant.finalize(epoch) for participant in self.participants.values()),
+                    return_exceptions=True,
+                )
+                cleanup_errors = [
+                    result for result in cleanup_results if isinstance(result, BaseException)
+                ]
+                if cleanup_errors:
+                    raise ResetCleanupError(
+                        f"participant reset cleanup failed: {cleanup_errors[0]}"
+                    ) from cleanup_errors[0]
+                await self.finalize_control(epoch)
+            except Exception:
+                await self.fail_control(epoch, "cleanup")
+                self.test_mode = "cleanup_error"
+                raise
+            self.test_mode = "active"
             return ResetResult(
                 scenarioId=bundle.scenario_id,
                 version=bundle.version,
@@ -190,6 +225,9 @@ class HttpParticipantClient:
 
     async def commit(self, epoch: str) -> None:
         await self.post("commit", {"scenarioEpoch": epoch})
+
+    async def finalize(self, epoch: str) -> None:
+        await self.post("finalize", {"scenarioEpoch": epoch})
 
     async def abort(self, epoch: str) -> None:
         await self.post("abort", {"scenarioEpoch": epoch})
@@ -232,8 +270,16 @@ class ControlResetStore:
             if state is None:
                 state = ScenarioState(singleton_id=1, mode="uninitialised", active_epoch="none")
                 session.add(state)
+            if state.mode not in {"active", "uninitialised"} and not (
+                state.mode == "error" and state.pending_epoch is None
+            ):
+                raise ApiError(ErrorCode.CONFLICT, "another reset is active", status_code=409)
             state.mode = "preparing"
             state.pending_epoch = epoch
+            state.pending_scenario_id = bundle.scenario_id
+            state.pending_scenario_version = bundle.version
+            state.pending_random_seed = seed
+            state.pending_manifest_checksum = bundle.checksum
             await session.execute(delete(FaultActivation))
             await session.execute(delete(FaultRule))
             clock = await session.get(VirtualClock, 1)
@@ -256,30 +302,63 @@ class ControlResetStore:
     async def commit(self, epoch: str, bundle: ScenarioBundle, seed: int) -> None:
         async with self.factory.begin() as session:
             state = await session.get(ScenarioState, 1, with_for_update=True)
-            if state is None or state.pending_epoch != epoch:
+            if state is None or state.pending_epoch != epoch or state.mode != "preparing":
                 raise RuntimeError("control reset epoch differs")
             state.active_epoch = epoch
+            state.mode = "finalizing"
+            state.scenario_id = state.pending_scenario_id
+            state.scenario_version = state.pending_scenario_version
+            state.random_seed = state.pending_random_seed
+            state.manifest_checksum = state.pending_manifest_checksum
+            run = await session.scalar(select(ResetRun).where(ResetRun.scenario_epoch == epoch))
+            if run is None:
+                raise RuntimeError("control reset run is missing")
+            run.state = "finalizing"
+
+    async def finalize(self, epoch: str) -> None:
+        async with self.factory.begin() as session:
+            state = await session.get(ScenarioState, 1, with_for_update=True)
+            if state is not None and state.active_epoch == epoch and state.mode == "active":
+                return
+            if (
+                state is None
+                or state.active_epoch != epoch
+                or state.pending_epoch != epoch
+                or state.mode not in {"finalizing", "error"}
+            ):
+                raise RuntimeError("control reset is not ready to finalize")
             state.pending_epoch = None
+            self.clear_pending_metadata(state)
             state.mode = "active"
-            state.scenario_id = bundle.scenario_id
-            state.scenario_version = bundle.version
-            state.random_seed = seed
-            state.manifest_checksum = bundle.checksum
             run = await session.scalar(select(ResetRun).where(ResetRun.scenario_epoch == epoch))
             if run is None:
                 raise RuntimeError("control reset run is missing")
             run.state = "committed"
+            run.error = None
 
-    async def fail(self, epoch: str) -> None:
+    async def fail(self, epoch: str, phase: ResetFailurePhase) -> None:
         async with self.factory.begin() as session:
             state = await session.get(ScenarioState, 1, with_for_update=True)
             if state is not None and state.pending_epoch == epoch:
-                state.pending_epoch = None
                 state.mode = "error"
+                if phase == "pre_cutover":
+                    state.pending_epoch = None
+                    self.clear_pending_metadata(state)
             run = await session.scalar(select(ResetRun).where(ResetRun.scenario_epoch == epoch))
             if run is not None:
                 run.state = "failed"
-                run.error = "participant reset failed"
+                run.error = (
+                    "participant reset failed before cutover"
+                    if phase == "pre_cutover"
+                    else "participant reset cleanup failed"
+                )
+
+    @staticmethod
+    def clear_pending_metadata(state: ScenarioState) -> None:
+        state.pending_scenario_id = None
+        state.pending_scenario_version = None
+        state.pending_random_seed = None
+        state.pending_manifest_checksum = None
 
 
 def reset_router(

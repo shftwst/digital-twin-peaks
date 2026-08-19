@@ -16,6 +16,7 @@ class Participant:
         self.name = name
         self.fail_on = fail_on
         self.calls: list[tuple[str, str]] = []
+        self.active_epoch = "epoch_old"
 
     async def prepare(self, epoch: str) -> None:
         self.calls.append(("prepare", epoch))
@@ -33,9 +34,19 @@ class Participant:
 
     async def commit(self, epoch: str) -> None:
         self.calls.append(("commit", epoch))
+        if self.fail_on == "commit":
+            raise RuntimeError(f"{self.name} commit failed")
+        self.active_epoch = epoch
 
     async def abort(self, epoch: str) -> None:
         self.calls.append(("abort", epoch))
+        if self.active_epoch == epoch:
+            self.active_epoch = "epoch_old"
+
+    async def finalize(self, epoch: str) -> None:
+        self.calls.append(("finalize", epoch))
+        if self.fail_on == "finalize":
+            raise RuntimeError(f"{self.name} finalize failed")
 
 
 @pytest.mark.asyncio
@@ -61,8 +72,18 @@ async def test_reset_is_ordered_and_same_inputs_have_same_checksum() -> None:
 
     assert first.manifest_checksum == second.manifest_checksum
     assert first.random_seed == 7
-    assert [name for name, _epoch in identity.calls[:3]] == ["prepare", "load", "commit"]
-    assert [name for name, _epoch in crm.calls[:3]] == ["prepare", "load", "commit"]
+    assert [name for name, _epoch in identity.calls[:4]] == [
+        "prepare",
+        "load",
+        "commit",
+        "finalize",
+    ]
+    assert [name for name, _epoch in crm.calls[:4]] == [
+        "prepare",
+        "load",
+        "commit",
+        "finalize",
+    ]
 
 
 @pytest.mark.asyncio
@@ -83,6 +104,45 @@ async def test_failed_load_aborts_every_participant_and_marks_estate_unhealthy()
     assert identity.calls[-1][0] == "abort"
     assert crm.calls[-1][0] == "abort"
     assert coordinator.test_mode == "error"
+
+
+@pytest.mark.asyncio
+async def test_finalize_failure_keeps_every_participant_on_the_new_epoch_without_abort() -> None:
+    identity = Participant("identity", fail_on="finalize")
+    crm = Participant("crm")
+    bundle = ScenarioBundle(
+        scenario_id="platform-contracts",
+        version=1,
+        initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
+        payloads={"identity": {"expectedCounts": {}}, "crm": {"expectedCounts": {}}},
+    )
+    coordinator = ResetCoordinator.for_test({"identity": identity, "crm": crm}, bundle)
+
+    with pytest.raises(RuntimeError, match="finalize failed"):
+        await coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+
+    assert identity.active_epoch == crm.active_epoch
+    assert identity.active_epoch != "epoch_old"
+    assert all(action != "abort" for action, _epoch in identity.calls)
+    assert all(action != "abort" for action, _epoch in crm.calls)
+    assert coordinator.test_mode == "cleanup_error"
+
+
+@pytest.mark.asyncio
+async def test_participant_services_must_exactly_match_bundle_before_reset_begins() -> None:
+    identity = Participant("identity")
+    bundle = ScenarioBundle(
+        scenario_id="platform-contracts",
+        version=1,
+        initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
+        payloads={"identity": {"expectedCounts": {}}, "crm": {"expectedCounts": {}}},
+    )
+    coordinator = ResetCoordinator.for_test({"identity": identity}, bundle)
+
+    with pytest.raises(ValueError, match="participant services differ"):
+        await coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+
+    assert identity.calls == []
 
 
 def test_default_seed_is_deterministic_and_fits_postgresql_bigint() -> None:

@@ -19,6 +19,15 @@ class ScenarioState(Base):
     scenario_version: Mapped[int | None] = mapped_column(Integer)
     random_seed: Mapped[int | None] = mapped_column(BigInteger)
     manifest_checksum: Mapped[str | None] = mapped_column(String(64))
+    pending_scenario_id: Mapped[str | None] = mapped_column(String(80))
+    pending_scenario_version: Mapped[int | None] = mapped_column(Integer)
+    pending_random_seed: Mapped[int | None] = mapped_column(BigInteger)
+    pending_manifest_checksum: Mapped[str | None] = mapped_column(String(64))
+    rollback_epoch: Mapped[str | None] = mapped_column(String(64))
+    rollback_scenario_id: Mapped[str | None] = mapped_column(String(80))
+    rollback_scenario_version: Mapped[int | None] = mapped_column(Integer)
+    rollback_random_seed: Mapped[int | None] = mapped_column(BigInteger)
+    rollback_manifest_checksum: Mapped[str | None] = mapped_column(String(64))
 
 
 class AuditRecord(ScenarioOwned, Base):

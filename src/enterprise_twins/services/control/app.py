@@ -93,6 +93,7 @@ def create_from_env() -> FastAPI:
         store.begin,
         store.commit,
         store.fail,
+        store.finalize,
     )
 
     @asynccontextmanager

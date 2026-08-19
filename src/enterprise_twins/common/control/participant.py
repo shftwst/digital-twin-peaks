@@ -1,6 +1,6 @@
 from typing import Any, Protocol
 
-from fastapi import APIRouter, Depends, FastAPI
+from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -41,10 +41,10 @@ class ResetParticipant:
     async def database_ready(self) -> bool:
         try:
             async with self.factory() as session:
-                await session.get(ScenarioState, 1)
+                state = await session.get(ScenarioState, 1)
         except Exception:
             return False
-        return True
+        return state is not None and state.mode == "active"
 
     async def prepare(self, epoch: str) -> None:
         async with self.factory.begin() as session:
@@ -56,6 +56,8 @@ class ResetParticipant:
                 raise ApiError(ErrorCode.CONFLICT, "another reset is active", status_code=409)
             state.mode = "preparing"
             state.pending_epoch = epoch
+            self.clear_pending_metadata(state)
+            self.clear_rollback_metadata(state)
             await session.execute(delete(IdempotencyRecord))
             await session.execute(delete(OutboxRecord))
             await session.execute(delete(AuditRecord))
@@ -81,10 +83,10 @@ class ResetParticipant:
                 )
             result = await self.loader.load(session, request.scenario_epoch, request.payload)
             state.mode = "loaded"
-            state.scenario_id = request.scenario_id
-            state.scenario_version = request.scenario_version
-            state.random_seed = request.random_seed
-            state.manifest_checksum = request.checksum
+            state.pending_scenario_id = request.scenario_id
+            state.pending_scenario_version = request.scenario_version
+            state.pending_random_seed = request.random_seed
+            state.pending_manifest_checksum = request.manifest_checksum
             return ParticipantReport.model_validate(
                 {
                     "service": self.service,
@@ -104,23 +106,84 @@ class ResetParticipant:
                     "participant has not loaded this epoch",
                     status_code=409,
                 )
-            previous = state.active_epoch
+            state.rollback_epoch = state.active_epoch
+            state.rollback_scenario_id = state.scenario_id
+            state.rollback_scenario_version = state.scenario_version
+            state.rollback_random_seed = state.random_seed
+            state.rollback_manifest_checksum = state.manifest_checksum
             state.active_epoch = epoch
+            state.scenario_id = state.pending_scenario_id
+            state.scenario_version = state.pending_scenario_version
+            state.random_seed = state.pending_random_seed
+            state.manifest_checksum = state.pending_manifest_checksum
+            state.mode = "committed"
+
+    async def finalize(self, epoch: str) -> None:
+        async with self.factory.begin() as session:
+            state = await session.get(ScenarioState, 1, with_for_update=True)
+            if (
+                state is not None
+                and state.active_epoch == epoch
+                and state.mode == "active"
+                and state.rollback_epoch is None
+            ):
+                return
+            if (
+                state is None
+                or state.active_epoch != epoch
+                or state.pending_epoch != epoch
+                or state.mode != "committed"
+                or state.rollback_epoch is None
+            ):
+                raise ApiError(
+                    ErrorCode.CONFLICT,
+                    "participant has not committed this epoch",
+                    status_code=409,
+                )
+            if state.rollback_epoch != "none":
+                await self.loader.discard(session, state.rollback_epoch)
             state.pending_epoch = None
+            self.clear_pending_metadata(state)
+            self.clear_rollback_metadata(state)
             state.mode = "active"
-            if previous != "none":
-                await self.loader.discard(session, previous)
 
     async def abort(self, epoch: str) -> None:
         async with self.factory.begin() as session:
             state = await session.get(ScenarioState, 1, with_for_update=True)
             if state is None:
                 return
+            if state.active_epoch == epoch and state.rollback_epoch is not None:
+                await self.loader.discard(session, epoch)
+                state.active_epoch = state.rollback_epoch
+                state.scenario_id = state.rollback_scenario_id
+                state.scenario_version = state.rollback_scenario_version
+                state.random_seed = state.rollback_random_seed
+                state.manifest_checksum = state.rollback_manifest_checksum
+                state.pending_epoch = None
+                self.clear_pending_metadata(state)
+                self.clear_rollback_metadata(state)
+                state.mode = "error"
+                return
             if state.pending_epoch == epoch:
                 await self.loader.discard(session, epoch)
                 state.pending_epoch = None
-            if state.active_epoch == epoch or state.mode != "active":
+                self.clear_pending_metadata(state)
                 state.mode = "error"
+
+    @staticmethod
+    def clear_pending_metadata(state: ScenarioState) -> None:
+        state.pending_scenario_id = None
+        state.pending_scenario_version = None
+        state.pending_random_seed = None
+        state.pending_manifest_checksum = None
+
+    @staticmethod
+    def clear_rollback_metadata(state: ScenarioState) -> None:
+        state.rollback_epoch = None
+        state.rollback_scenario_id = None
+        state.rollback_scenario_version = None
+        state.rollback_random_seed = None
+        state.rollback_manifest_checksum = None
 
 
 def create_participant_app(name: str, participant: ResetParticipant, token: str) -> FastAPI:
@@ -139,6 +202,10 @@ def create_participant_app(name: str, participant: ResetParticipant, token: str)
     async def commit(body: dict[str, str]) -> None:
         await participant.commit(body["scenarioEpoch"])
 
+    @router.post("/finalize", status_code=204)
+    async def finalize(body: dict[str, str]) -> None:
+        await participant.finalize(body["scenarioEpoch"])
+
     @router.post("/abort", status_code=204)
     async def abort(body: dict[str, str]) -> None:
         await participant.abort(body["scenarioEpoch"])
@@ -153,6 +220,20 @@ def create_participant_app(name: str, participant: ResetParticipant, token: str)
         return JSONResponse(
             {"status": "ready" if is_ready else "not_ready"},
             status_code=200 if is_ready else 503,
+        )
+
+    @app.exception_handler(ApiError)
+    async def api_error(_request: Request, error: ApiError) -> JSONResponse:
+        return JSONResponse(
+            {
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                    "retryable": error.retryable,
+                    "details": error.details,
+                }
+            },
+            status_code=error.status_code,
         )
 
     app.include_router(router)

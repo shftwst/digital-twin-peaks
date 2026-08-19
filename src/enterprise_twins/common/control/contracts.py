@@ -114,6 +114,7 @@ class ParticipantLoadRequest(BaseModel):
     random_seed: int = Field(alias="randomSeed")
     payload: dict[str, Any]
     checksum: str
+    manifest_checksum: str = Field(alias="manifestChecksum")
 
 
 class ParticipantReport(BaseModel):
