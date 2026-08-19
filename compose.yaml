@@ -1,4 +1,16 @@
 name: enterprise-twins
+
+x-common-environment: &common-environment
+  PYTHONUNBUFFERED: "1"
+
+x-twin-service: &twin-service
+  build:
+    context: .
+  environment: *common-environment
+  depends_on:
+    postgres:
+      condition: service_healthy
+
 services:
   postgres:
     image: postgres:18-alpine
@@ -16,6 +28,210 @@ services:
       retries: 30
     networks: [twin-integration, twin-control]
 
+  identity-admin:
+    <<: *twin-service
+    command:
+      - enterprise_twins.runtime
+      - identity
+      - enterprise_twins.services.identity.admin_app:create_from_env
+      - --port
+      - "9000"
+    environment:
+      <<: *common-environment
+      TWINS_DATABASE_URL: postgresql+asyncpg://identity_user:identity_local_only@postgres/identity
+      TWINS_IDENTITY_DATABASE_URL: postgresql+asyncpg://identity_user:identity_local_only@postgres/identity
+      TWINS_IDENTITY_PARTICIPANT_TOKEN: participant-local-token
+      TWINS_IDENTITY_SECRET_PEPPER: identity-local-pepper
+    healthcheck: &admin-health
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:9000/health/ready', timeout=1)
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks: [twin-control]
+
+  crm-admin:
+    <<: *twin-service
+    command:
+      - enterprise_twins.runtime
+      - crm
+      - enterprise_twins.services.crm.admin_app:create_from_env
+      - --port
+      - "9000"
+    environment:
+      <<: *common-environment
+      TWINS_DATABASE_URL: postgresql+asyncpg://crm_user:crm_local_only@postgres/crm
+      TWINS_CRM_DATABASE_URL: postgresql+asyncpg://crm_user:crm_local_only@postgres/crm
+      TWINS_CRM_PARTICIPANT_TOKEN: participant-local-token
+    healthcheck: *admin-health
+    networks: [twin-control]
+
+  event-relay-admin:
+    <<: *twin-service
+    command:
+      - enterprise_twins.runtime
+      - relay
+      - enterprise_twins.services.relay.admin_app:create_from_env
+      - --port
+      - "9000"
+    environment:
+      <<: *common-environment
+      TWINS_DATABASE_URL: postgresql+asyncpg://relay_user:relay_local_only@postgres/relay
+      TWINS_RELAY_DATABASE_URL: postgresql+asyncpg://relay_user:relay_local_only@postgres/relay
+      TWINS_RELAY_PARTICIPANT_TOKEN: participant-local-token
+    healthcheck: *admin-health
+    networks: [twin-control]
+
+  control:
+    <<: *twin-service
+    command:
+      - enterprise_twins.runtime
+      - control
+      - enterprise_twins.services.control.app:create_from_env
+    environment:
+      <<: *common-environment
+      TWINS_DATABASE_URL: postgresql+asyncpg://control_user:control_local_only@postgres/control
+      TWINS_CONTROL_DATABASE_URL: postgresql+asyncpg://control_user:control_local_only@postgres/control
+      TWINS_CONTROL_CONTROLLER_TOKEN: controller-local-token
+      TWINS_CONTROL_TWIN_TOKEN: twin-local-token
+      TWINS_CONTROL_PARTICIPANT_TOKEN: participant-local-token
+      TWINS_CONTROL_PARTICIPANTS: >-
+        {"identity":"http://identity-admin:9000","crm":"http://crm-admin:9000","relay":"http://event-relay-admin:9000"}
+      TWINS_CONTROL_SCENARIO_ROOT: /app/scenarios/base
+      TWINS_CONTROL_BOOTSTRAP_SCENARIO: platform-contracts
+      TWINS_CONTROL_BOOTSTRAP_VERSION: "1"
+    volumes:
+      - ./scenarios:/app/scenarios:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      identity-admin:
+        condition: service_started
+      crm-admin:
+        condition: service_started
+      event-relay-admin:
+        condition: service_started
+    healthcheck: &public-health
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=1)
+      interval: 2s
+      timeout: 2s
+      retries: 45
+    networks: [twin-control]
+
+  event-relay-api:
+    <<: *twin-service
+    command:
+      - enterprise_twins.runtime
+      - relay
+      - enterprise_twins.services.relay.app:create_from_env
+    environment: &relay-environment
+      <<: *common-environment
+      TWINS_DATABASE_URL: postgresql+asyncpg://relay_user:relay_local_only@postgres/relay
+      TWINS_RELAY_DATABASE_URL: postgresql+asyncpg://relay_user:relay_local_only@postgres/relay
+      TWINS_RELAY_CONTROL_URL: http://control:8000
+      TWINS_RELAY_CONTROL_TOKEN: twin-local-token
+      TWINS_RELAY_SOURCE_TOKENS: >-
+        {"identity":"identity-relay-local-token","crm":"crm-relay-local-token"}
+      TWINS_RELAY_ALLOWED_TARGETS: '["webhook-receiver","host.docker.internal"]'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      event-relay-admin:
+        condition: service_started
+      control:
+        condition: service_healthy
+    healthcheck: *public-health
+    networks: [twin-integration, twin-control]
+
+  event-relay-worker:
+    <<: *twin-service
+    command: [enterprise_twins.services.relay.delivery]
+    environment: *relay-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      control:
+        condition: service_healthy
+      event-relay-api:
+        condition: service_healthy
+    networks: [twin-integration, twin-webhook-egress, twin-control]
+
+  identity:
+    <<: *twin-service
+    command:
+      - enterprise_twins.runtime
+      - identity
+      - enterprise_twins.services.identity.app:create_from_env
+    environment:
+      <<: *common-environment
+      TWINS_DATABASE_URL: postgresql+asyncpg://identity_user:identity_local_only@postgres/identity
+      TWINS_IDENTITY_DATABASE_URL: postgresql+asyncpg://identity_user:identity_local_only@postgres/identity
+      TWINS_IDENTITY_ISSUER: http://identity:8000
+      TWINS_IDENTITY_AUDIENCE: enterprise-twins
+      TWINS_IDENTITY_SIGNING_SEED: identity-test-signing-seed
+      TWINS_IDENTITY_SECRET_PEPPER: identity-local-pepper
+      TWINS_IDENTITY_TOKEN_TTL_SECONDS: "600"
+      TWINS_IDENTITY_CONTROL_URL: http://control:8000
+      TWINS_IDENTITY_CONTROL_TOKEN: twin-local-token
+      TWINS_IDENTITY_RELAY_URL: http://event-relay-api:8000
+      TWINS_IDENTITY_RELAY_TOKEN: identity-relay-local-token
+    depends_on:
+      postgres:
+        condition: service_healthy
+      identity-admin:
+        condition: service_started
+      control:
+        condition: service_healthy
+      event-relay-api:
+        condition: service_healthy
+    healthcheck: *public-health
+    ports: ["127.0.0.1:8101:8000"]
+    networks: [twin-public, twin-integration, twin-control]
+
+  crm:
+    <<: *twin-service
+    command:
+      - enterprise_twins.runtime
+      - crm
+      - enterprise_twins.services.crm.app:create_from_env
+    environment:
+      <<: *common-environment
+      TWINS_DATABASE_URL: postgresql+asyncpg://crm_user:crm_local_only@postgres/crm
+      TWINS_CRM_DATABASE_URL: postgresql+asyncpg://crm_user:crm_local_only@postgres/crm
+      TWINS_CRM_CURSOR_SECRET: crm-local-cursor-secret
+      TWINS_CRM_IDENTITY_ISSUER: http://identity:8000
+      TWINS_CRM_IDENTITY_JWKS_URL: http://identity:8000/.well-known/jwks.json
+      TWINS_CRM_IDENTITY_AUDIENCE: enterprise-twins
+      TWINS_CRM_CONTROL_URL: http://control:8000
+      TWINS_CRM_CONTROL_TOKEN: twin-local-token
+      TWINS_CRM_RELAY_URL: http://event-relay-api:8000
+      TWINS_CRM_RELAY_TOKEN: crm-relay-local-token
+    depends_on:
+      postgres:
+        condition: service_healthy
+      crm-admin:
+        condition: service_started
+      control:
+        condition: service_healthy
+      identity:
+        condition: service_healthy
+      event-relay-api:
+        condition: service_healthy
+    healthcheck: *public-health
+    ports: ["127.0.0.1:8102:8000"]
+    networks: [twin-public, twin-integration, twin-control]
+
   test-runner:
     profiles: [test]
     build:
@@ -24,10 +240,19 @@ services:
     environment:
       TEST_DATABASE_URL: postgresql+asyncpg://platform_test_user:platform_test_local_only@postgres/platform_test
       IDENTITY_DATABASE_URL: postgresql://identity_user:identity_local_only@postgres/identity
+      CONTROL_URL: http://control:8000
+      CONTROL_TOKEN: controller-local-token
+      RUN_LIVE_TOPOLOGY_TESTS: "1"
     depends_on:
       postgres:
         condition: service_healthy
-    networks: [twin-integration, twin-control]
+      control:
+        condition: service_healthy
+      identity:
+        condition: service_healthy
+      crm:
+        condition: service_healthy
+    networks: [twin-public, twin-control]
     command: ["python", "-c", "import time; time.sleep(10**9)"]
 
 volumes:

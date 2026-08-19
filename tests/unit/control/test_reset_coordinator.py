@@ -69,9 +69,15 @@ async def test_reset_is_ordered_and_same_inputs_have_same_checksum() -> None:
     second = await coordinator.reset(
         ResetRequest(scenarioId="platform-contracts", version=1, randomSeed=7)
     )
+    different_seed = await coordinator.reset(
+        ResetRequest(scenarioId="platform-contracts", version=1, randomSeed=8)
+    )
 
     assert first.manifest_checksum == second.manifest_checksum
+    assert first.manifest_checksum != different_seed.manifest_checksum
     assert first.random_seed == 7
+    assert different_seed.random_seed == 8
+    assert first.scenario_epoch != second.scenario_epoch
     assert [name for name, _epoch in identity.calls[:4]] == [
         "prepare",
         "load",
@@ -151,6 +157,25 @@ def test_default_seed_is_deterministic_and_fits_postgresql_bigint() -> None:
 
     assert first == second
     assert 0 <= first <= 9_223_372_036_854_775_807
+
+
+@pytest.mark.asyncio
+async def test_omitted_seed_is_resolved_into_result_and_manifest_checksum() -> None:
+    bundle = ScenarioBundle(
+        scenario_id="platform-contracts",
+        version=1,
+        initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
+        payloads={},
+    )
+    coordinator = ResetCoordinator.for_test({}, bundle)
+
+    result = await coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+
+    assert result.random_seed == 4_470_957_409_635_312_983
+    assert (
+        result.manifest_checksum
+        == "23730c373fbf37ddb6ba71af98ba49dd809032700c6757ddd0812ed4c85056cf"
+    )
 
 
 def test_explicit_seed_is_limited_to_non_negative_postgresql_bigint() -> None:

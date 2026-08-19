@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "1",
+  "expectedCounts": {"customers": 3, "notes": 0},
+  "aliases": {"uniqueCustomer": "cus_unique"},
+  "customers": [
+    {
+      "customerId": "cus_unique",
+      "displayName": "Alex Unique",
+      "primaryEmail": "alex.unique@example.test",
+      "externalReference": "ext-unique",
+      "accountStatus": "active",
+      "contactMethods": [
+        {"type": "email", "value": "alex.unique@example.test", "primary": true}
+      ],
+      "externalIdentifiers": {"loyalty": "LOY-1001"},
+      "version": 1
+    },
+    {
+      "customerId": "cus_ambiguous_a",
+      "displayName": "Sam Shared A",
+      "primaryEmail": "shared@example.test",
+      "externalReference": "ext-shared-a",
+      "accountStatus": "active",
+      "contactMethods": [
+        {"type": "email", "value": "shared@example.test", "primary": true}
+      ],
+      "externalIdentifiers": {"loyalty": "LOY-2001"},
+      "version": 1
+    },
+    {
+      "customerId": "cus_ambiguous_b",
+      "displayName": "Sam Shared B",
+      "primaryEmail": "shared@example.test",
+      "externalReference": "ext-shared-b",
+      "accountStatus": "active",
+      "contactMethods": [
+        {"type": "email", "value": "shared@example.test", "primary": true}
+      ],
+      "externalIdentifiers": {"loyalty": "LOY-2002"},
+      "version": 1
+    }
+  ],
+  "notes": []
+}

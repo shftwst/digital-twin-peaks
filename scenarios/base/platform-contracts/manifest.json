@@ -1,0 +1,19 @@
+{
+  "initialTime": "2026-08-19T10:00:00Z",
+  "scenarioId": "platform-contracts",
+  "services": {
+    "crm": {
+      "checksum": "e5eca84a8ea7803523fe83bff5219a8c6fb584e3dd18351acb96b9e2416d2ab3",
+      "file": "crm.json"
+    },
+    "identity": {
+      "checksum": "da25827f0d1498e73ce055f3296894425608eb4c23cf0056d94d44940f315f61",
+      "file": "identity.json"
+    },
+    "relay": {
+      "checksum": "0b94c9bbc7d99bcdb67d991afbd0adde9d281cbb35ae5263014384f539b7234e",
+      "file": "relay.json"
+    }
+  },
+  "version": 1
+}

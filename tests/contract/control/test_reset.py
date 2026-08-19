@@ -2,6 +2,7 @@ import asyncio
 import os
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
@@ -10,7 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from enterprise_twins.common.control.contracts import ResetRequest
 from enterprise_twins.common.db.records import ScenarioState
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
-from enterprise_twins.services.control.app import build_control_app, create_from_env
+from enterprise_twins.services.control.app import (
+    bootstrap_scenario,
+    build_control_app,
+    create_from_env,
+)
 from enterprise_twins.services.control.models import ResetRun, VirtualClock
 from enterprise_twins.services.control.reset import (
     ControlResetStore,
@@ -18,6 +23,103 @@ from enterprise_twins.services.control.reset import (
     ScenarioBundle,
 )
 from enterprise_twins.services.control.settings import ControlSettings
+
+
+class MissingRepository:
+    async def state(self) -> ScenarioState:
+        from enterprise_twins.services.control.repository import ScenarioStateMissingError
+
+        raise ScenarioStateMissingError("scenario state is absent")
+
+
+class ExistingRepository:
+    async def state(self) -> ScenarioState:
+        return ScenarioState(singleton_id=1, mode="active", active_epoch="epoch_existing")
+
+
+class BootstrapCoordinator:
+    def __init__(self, failures: list[Exception]) -> None:
+        self.failures = failures
+        self.calls = 0
+
+    async def reset(self, _request: ResetRequest) -> object:
+        self.calls += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        return object()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_retries_transient_participant_startup_failure() -> None:
+    coordinator = BootstrapCoordinator(
+        [
+            httpx.ConnectError(
+                "participant is not listening",
+                request=httpx.Request("POST", "http://identity-admin:9000"),
+            )
+        ]
+    )
+
+    await bootstrap_scenario(
+        MissingRepository(),
+        coordinator,
+        ResetRequest(scenarioId="platform-contracts", version=1),
+        timeout_seconds=1.0,
+        retry_delay_seconds=0.0,
+    )
+
+    assert coordinator.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_does_not_retry_reset_contract_failure() -> None:
+    coordinator = BootstrapCoordinator([RuntimeError("participant report differs")])
+
+    with pytest.raises(RuntimeError, match="participant report differs"):
+        await bootstrap_scenario(
+            MissingRepository(),
+            coordinator,
+            ResetRequest(scenarioId="platform-contracts", version=1),
+            timeout_seconds=1.0,
+            retry_delay_seconds=0.0,
+        )
+
+    assert coordinator.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_transport_retry_is_bounded() -> None:
+    failure = httpx.ConnectError(
+        "participant is not listening",
+        request=httpx.Request("POST", "http://identity-admin:9000"),
+    )
+    coordinator = BootstrapCoordinator([failure])
+
+    with pytest.raises(httpx.ConnectError, match="participant is not listening"):
+        await bootstrap_scenario(
+            MissingRepository(),
+            coordinator,
+            ResetRequest(scenarioId="platform-contracts", version=1),
+            timeout_seconds=0.0,
+            retry_delay_seconds=0.0,
+        )
+
+    assert coordinator.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_skips_reset_when_scenario_state_exists() -> None:
+    coordinator = BootstrapCoordinator([])
+
+    await bootstrap_scenario(
+        ExistingRepository(),
+        coordinator,
+        ResetRequest(scenarioId="platform-contracts", version=1),
+        timeout_seconds=1.0,
+        retry_delay_seconds=0.0,
+    )
+
+    assert coordinator.calls == 0
 
 
 def empty_bundle() -> ScenarioBundle:
@@ -114,6 +216,20 @@ async def test_control_reset_and_status_routes_require_controller_role(
     assert status.status_code == 200
     assert status.json()["scenarioEpoch"] == reset.json()["scenarioEpoch"]
     assert status.json()["mode"] == "active"
+    assert reset.json()["randomSeed"] == 7
+    assert status.json()["randomSeed"] == 7
+    assert status.json()["manifestChecksum"] == reset.json()["manifestChecksum"]
+    async with db() as session:
+        state = await session.get(ScenarioState, 1)
+        run = await session.scalar(
+            select(ResetRun).where(ResetRun.scenario_epoch == reset.json()["scenarioEpoch"])
+        )
+    assert state is not None
+    assert state.random_seed == 7
+    assert state.manifest_checksum == reset.json()["manifestChecksum"]
+    assert run is not None
+    assert run.random_seed == 7
+    assert run.manifest_checksum == reset.json()["manifestChecksum"]
 
 
 @pytest.mark.asyncio

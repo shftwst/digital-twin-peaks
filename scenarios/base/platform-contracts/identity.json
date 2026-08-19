@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "1",
+  "expectedCounts": {"clients": 3},
+  "aliases": {
+    "supportAgent": "support-agent",
+    "readOnlyEvaluator": "read-only-evaluator",
+    "webhookManager": "webhook-manager"
+  },
+  "clients": [
+    {
+      "clientId": "support-agent",
+      "clientSecret": "support-secret",
+      "subject": "person-support-1",
+      "actorType": "human",
+      "role": "support_agent",
+      "scopes": ["crm:read", "crm:notes:write"],
+      "tenantId": "tenant_synthetic"
+    },
+    {
+      "clientId": "read-only-evaluator",
+      "clientSecret": "evaluator-secret",
+      "subject": "service-evaluator-1",
+      "actorType": "service",
+      "role": "evaluator_service",
+      "scopes": ["crm:read"],
+      "tenantId": "tenant_synthetic"
+    },
+    {
+      "clientId": "webhook-manager",
+      "clientSecret": "webhook-secret",
+      "subject": "service-webhook-manager-1",
+      "actorType": "service",
+      "role": "platform_observer",
+      "scopes": ["webhooks:manage"],
+      "tenantId": "tenant_synthetic"
+    }
+  ]
+}

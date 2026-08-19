@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
@@ -11,7 +12,10 @@ from enterprise_twins.common.db.runtime import make_engine, make_session_factory
 from enterprise_twins.common.http.app import create_app
 from enterprise_twins.services.control.api import control_router
 from enterprise_twins.services.control.faults import FaultRepository, fault_router
-from enterprise_twins.services.control.repository import ControlRepository
+from enterprise_twins.services.control.repository import (
+    ControlRepository,
+    ScenarioStateMissingError,
+)
 from enterprise_twins.services.control.reset import (
     ControlResetStore,
     DirectoryBundleLoader,
@@ -41,6 +45,34 @@ class ControlStatus:
             return False, {"database": "not_ready", "clock": "not_ready"}
         ready = state.mode == "active"
         return ready, {"database": "ready", "clock": "ready", "scenario": state.mode}
+
+
+async def bootstrap_scenario(
+    repository: ControlRepository,
+    coordinator: ResetCoordinator,
+    request: ResetRequest,
+    *,
+    timeout_seconds: float = 30.0,
+    retry_delay_seconds: float = 0.25,
+) -> None:
+    try:
+        await repository.state()
+    except ScenarioStateMissingError:
+        pass
+    else:
+        return
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while True:
+        try:
+            await coordinator.reset(request)
+            return
+        except httpx.TransportError:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise
+            await asyncio.sleep(min(retry_delay_seconds, remaining))
 
 
 def create_control_app(
@@ -100,15 +132,14 @@ def create_from_env() -> FastAPI:
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         repository = ControlRepository(factory)
         try:
-            await repository.state()
-        except RuntimeError:
-            await coordinator.reset(
+            await bootstrap_scenario(
+                repository,
+                coordinator,
                 ResetRequest(
                     scenarioId=settings.bootstrap_scenario,
                     version=settings.bootstrap_version,
-                )
+                ),
             )
-        try:
             yield
         finally:
             await http_client.aclose()

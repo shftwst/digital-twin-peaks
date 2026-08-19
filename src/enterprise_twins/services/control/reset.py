@@ -41,14 +41,14 @@ class ScenarioBundle:
     initial_time: datetime
     payloads: dict[str, dict[str, Any]]
 
-    @property
-    def checksum(self) -> str:
+    def checksum(self, random_seed: int) -> str:
         return sha256_hex(
             {
                 "scenarioId": self.scenario_id,
                 "version": self.version,
                 "initialTime": self.initial_time,
                 "payloads": self.payloads,
+                "randomSeed": random_seed,
             }
         )
 
@@ -129,6 +129,7 @@ class ResetCoordinator:
                 if request.random_seed is not None
                 else derive_seed(request.scenario_id, request.version)
             )
+            manifest_checksum = bundle.checksum(seed)
             epoch = new_id("epoch")
             reports: list[ParticipantReport] = []
             await self.begin_control(epoch, bundle, seed)
@@ -146,7 +147,7 @@ class ResetCoordinator:
                             randomSeed=seed,
                             payload=payload,
                             checksum=checksum,
-                            manifestChecksum=bundle.checksum,
+                            manifestChecksum=manifest_checksum,
                         )
                     )
                     if (
@@ -190,7 +191,7 @@ class ResetCoordinator:
                 version=bundle.version,
                 randomSeed=seed,
                 scenarioEpoch=epoch,
-                manifestChecksum=bundle.checksum,
+                manifestChecksum=manifest_checksum,
                 reports=reports,
             )
 
@@ -279,7 +280,7 @@ class ControlResetStore:
             state.pending_scenario_id = bundle.scenario_id
             state.pending_scenario_version = bundle.version
             state.pending_random_seed = seed
-            state.pending_manifest_checksum = bundle.checksum
+            state.pending_manifest_checksum = bundle.checksum(seed)
             await session.execute(delete(FaultActivation))
             await session.execute(delete(FaultRule))
             clock = await session.get(VirtualClock, 1)
@@ -295,7 +296,7 @@ class ControlResetStore:
                     random_seed=seed,
                     scenario_epoch=epoch,
                     state="preparing",
-                    manifest_checksum=bundle.checksum,
+                    manifest_checksum=bundle.checksum(seed),
                 )
             )
 
@@ -379,6 +380,7 @@ def reset_router(
         return {
             "scenarioId": state.scenario_id,
             "version": state.scenario_version,
+            "randomSeed": state.random_seed,
             "scenarioEpoch": state.active_epoch,
             "manifestChecksum": state.manifest_checksum,
             "mode": state.mode,

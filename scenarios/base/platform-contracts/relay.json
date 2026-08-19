@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "1",
+  "expectedCounts": {
+    "subscriptions": 0,
+    "events": 0,
+    "deliveries": 0,
+    "attempts": 0
+  },
+  "aliases": {},
+  "subscriptions": []
+}

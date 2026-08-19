@@ -7,6 +7,10 @@ from enterprise_twins.common.db.records import ScenarioState
 from enterprise_twins.services.control.models import VirtualClock
 
 
+class ScenarioStateMissingError(RuntimeError):
+    pass
+
+
 class ControlRepository:
     def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
         self.factory = factory
@@ -15,7 +19,7 @@ class ControlRepository:
         async with self.factory() as session:
             state = await session.get(ScenarioState, 1)
             if state is None:
-                raise RuntimeError("control scenario state is not initialised")
+                raise ScenarioStateMissingError("control scenario state is not initialised")
             return state
 
     async def now(self) -> datetime:
