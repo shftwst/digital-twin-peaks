@@ -208,6 +208,7 @@ SUCCESS_OPERATION_CONTRACTS = {
         expected={"sameEventId": True, "sameBodyHash": True},
         actual={"sameEventId": True, "sameBodyHash": True},
         response_status=204,
+        required_request_keys=("eventId", "bodyHash"),
     ),
     "crm.subscription.create": operation_contract(
         1,
@@ -588,6 +589,67 @@ RESTART_OPERATION_CONTRACTS = {
     ),
 }
 
+SUCCESS_OPERATION_SEQUENCE = (
+    "control.reset",
+    "identity.token.issue",
+    "identity.subscription.create",
+    "identity.token.issue",
+    "control.time.advance.identity-retry",
+    "relay.identity.retry",
+    "crm.subscription.create",
+    "receiver.signature.cross-subscription-reject",
+    "receiver.signature.zero-reject",
+    "identity.me",
+    "crm.customer.search",
+    "crm.customer.get",
+    "crm.note.create",
+    "crm.note.replay",
+)
+
+FAILURE_OPERATION_SEQUENCE = (
+    "control.reset",
+    "control.status.initial",
+    "identity.token.issue",
+    "identity.token.issue",
+    "auth.missing",
+    "identity.token.issue",
+    "auth.read-only-read",
+    "auth.read-only-write",
+    "crm.notes.after-read-only-denial",
+    "crm.search.ambiguous",
+    "crm.note.precondition.stale",
+    "crm.note.create.idempotency-baseline",
+    "crm.note.idempotency-mismatch",
+    "crm.notes.after-idempotency-denial",
+    "webhook.target.denied",
+    "control.fault.create",
+    "crm.customer.before-timeout",
+    "crm.note.after-commit-timeout",
+    "crm.note.timeout.read",
+    "crm.note.timeout.replay",
+    "control.fault-activations.before-reset",
+    "identity.subscription.create",
+    "crm.subscription.create",
+    "identity.subscriptions.before-reset",
+    "crm.subscriptions.before-reset",
+    "control.time.advance.pre-reset",
+    "control.reset",
+    "control.status.after-reset",
+    "identity.old-token.after-reset",
+    "identity.token.issue",
+    "identity.subscriptions.after-reset",
+    "crm.subscriptions.after-reset",
+    "identity.token.issue",
+    "crm.notes.after-reset",
+    "control.fault-activations.after-reset",
+    "crm.note.idempotency-reuse.after-reset",
+)
+
+RESTART_OPERATION_SEQUENCE = (
+    "identity.token.issue",
+    "crm.notes.after-restart",
+)
+
 
 def object_body(response: httpx.Response) -> JsonObject:
     value = response.json()
@@ -756,6 +818,7 @@ def validate_transcript(value: object, name: str) -> list[JsonObject]:
 def validate_operation_contracts(
     calls: list[JsonObject],
     contracts: dict[str, OperationContract],
+    required_sequence: tuple[str, ...],
     name: str,
 ) -> None:
     counts = Counter(cast(str, call["operation"]) for call in calls)
@@ -771,6 +834,9 @@ def validate_operation_contracts(
         raise AssertionError(
             f"{name} operation contract multiplicity differs: {', '.join(differences)}"
         )
+    observed_sequence = tuple(cast(str, call["operation"]) for call in calls)
+    if observed_sequence != required_sequence:
+        raise AssertionError(f"{name} workflow order differs from the required sequence")
     for call in calls:
         operation = cast(str, call["operation"])
         contract = contracts[operation]
@@ -800,6 +866,52 @@ def validate_operation_contracts(
             or not expected_matches(contract.actual, assertion["actual"])
         ):
             raise AssertionError(f"{operation} operation contract differs from evidence")
+
+
+def operation_actuals(calls: list[JsonObject], operation: str) -> list[JsonObject]:
+    return [
+        evidence_object(call["assertion"], f"{operation} assertion")["actual"]
+        for call in calls
+        if call["operation"] == operation
+    ]
+
+
+def validate_reset_transcript_binding(
+    calls: list[JsonObject],
+    before: JsonObject,
+    after: JsonObject,
+    virtual_time: JsonObject,
+) -> None:
+    resets = [
+        evidence_object(value, "control.reset actual")
+        for value in operation_actuals(calls, "control.reset")
+    ]
+    initial_statuses = [
+        evidence_object(value, "initial Control status actual")
+        for value in operation_actuals(calls, "control.status.initial")
+    ]
+    after_statuses = [
+        evidence_object(value, "post-reset Control status actual")
+        for value in operation_actuals(calls, "control.status.after-reset")
+    ]
+    if len(resets) != 2 or len(initial_statuses) != 1 or len(after_statuses) != 1:
+        raise AssertionError("reset transcript does not contain the required Control records")
+    first_reset, second_reset = resets
+    initial_status = initial_statuses[0]
+    after_status = after_statuses[0]
+    safe_fields = ("scenarioEpoch", "manifestChecksum", "randomSeed")
+    if (
+        any(first_reset.get(field) != before.get(field) for field in safe_fields)
+        or any(second_reset.get(field) != after.get(field) for field in safe_fields)
+        or any(initial_status.get(field) != before.get(field) for field in safe_fields)
+        or any(after_status.get(field) != after.get(field) for field in safe_fields)
+        or initial_status.get("now") != virtual_time.get("initial")
+        or after_status.get("now") != virtual_time.get("afterReset")
+        or first_reset.get("scenarioEpoch") == second_reset.get("scenarioEpoch")
+        or first_reset.get("manifestChecksum") != second_reset.get("manifestChecksum")
+        or first_reset.get("randomSeed") != second_reset.get("randomSeed")
+    ):
+        raise AssertionError("reset transcript and reset evidence disagree")
 
 
 def run_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
@@ -1269,7 +1381,11 @@ class Driver:
             operation="relay.identity.retry",
             method="POST",
             path="/events",
-            request_fields={"virtualAdvance": "PT2S"},
+            request_fields={
+                "virtualAdvance": "PT2S",
+                "eventId": original["eventId"],
+                "bodyHash": original["bodyHash"],
+            },
             expected={"sameEventId": True, "sameBodyHash": True},
             actual={
                 "sameEventId": retried["eventId"] == original["eventId"],
@@ -2230,7 +2346,11 @@ class Driver:
 
     def summarise(self, mode: str) -> None:
         required_by_mode = {
-            "platform-success": {"successful-calls.json", "webhook-transcript.json"},
+            "platform-success": {
+                "successful-calls.json",
+                "webhook-transcript.json",
+                "prepare-state.json",
+            },
             "platform-failure": {
                 "failure-calls.json",
                 "fault-activations.json",
@@ -2245,6 +2365,7 @@ class Driver:
                 "restart-calls.json",
                 "restart.json",
                 "network.json",
+                "prepare-state.json",
             },
         }
         required = required_by_mode[mode]
@@ -2290,6 +2411,7 @@ class Driver:
             validate_operation_contracts(
                 successful,
                 SUCCESS_OPERATION_CONTRACTS,
+                SUCCESS_OPERATION_SEQUENCE,
                 "successful transcript",
             )
             cross_calls = [
@@ -2308,6 +2430,42 @@ class Driver:
                 raise AssertionError(
                     "cross-subscription receiver attempt does not match the transcript"
                 )
+            retry_call = next(
+                call for call in successful if call["operation"] == "relay.identity.retry"
+            )
+            retry_request = evidence_object(retry_call["request"], "Identity retry request")
+            retry_fields = evidence_object(retry_request["fields"], "Identity retry request fields")
+            matching_retry_attempts = [
+                attempt
+                for attempt in attempts
+                if attempt.get("eventId") == retry_fields.get("eventId")
+                and attempt.get("bodyHash") == retry_fields.get("bodyHash")
+                and attempt.get("source") == "identity"
+                and attempt.get("eventType") == "identity.token.issued"
+            ]
+            if not any(
+                attempt.get("outcome") == "unarmed" and attempt.get("responseStatus") == 503
+                for attempt in matching_retry_attempts
+            ) or not any(
+                attempt.get("outcome") == "accepted" and attempt.get("responseStatus") == 204
+                for attempt in matching_retry_attempts
+            ):
+                raise AssertionError("Identity retry attempts do not match the transcript")
+            prepare = evidence["prepare-state.json"]
+            success_reset = evidence_object(
+                operation_actuals(successful, "control.reset")[0],
+                "successful reset actual",
+            )
+            created_note = evidence_object(
+                operation_actuals(successful, "crm.note.create")[0],
+                "created note actual",
+            )
+            if (
+                prepare.get("scenarioEpoch") != success_reset.get("scenarioEpoch")
+                or prepare.get("manifestChecksum") != success_reset.get("manifestChecksum")
+                or prepare.get("noteId") != created_note.get("noteId")
+            ):
+                raise AssertionError("prepare state does not match the success transcript")
         if mode in {"platform-failure", "platform-contracts"}:
             failures = validate_transcript(
                 evidence["failure-calls.json"].get("calls"), "failure-call"
@@ -2331,6 +2489,7 @@ class Driver:
             validate_operation_contracts(
                 failures,
                 FAILURE_OPERATION_CONTRACTS,
+                FAILURE_OPERATION_SEQUENCE,
                 "failure transcript",
             )
             activations = evidence_list(
@@ -2338,6 +2497,17 @@ class Driver:
             )
             if len(activations) != 1 or activations[0].get("ruleId") != "crm-note-timeout-once":
                 raise AssertionError("failure evidence does not prove one timeout activation")
+            activation_actual = evidence_object(
+                operation_actuals(
+                    failures,
+                    "control.fault-activations.before-reset",
+                )[0],
+                "fault activation transcript actual",
+            )
+            if activation_actual.get("ruleIds") != [
+                activation.get("ruleId") for activation in activations
+            ]:
+                raise AssertionError("fault activation file does not match the transcript")
             reset = evidence["reset-checksums.json"]
             before = evidence_object(reset.get("before"), "reset before")
             after = evidence_object(reset.get("after"), "reset after")
@@ -2380,6 +2550,12 @@ class Driver:
                 or not all(value is True for value in reset_assertions.values())
             ):
                 raise AssertionError("observed reset evidence does not prove the contract")
+            validate_reset_transcript_binding(
+                failures,
+                before,
+                after,
+                virtual_time,
+            )
         if mode == "platform-contracts":
             restart_calls = validate_transcript(
                 evidence["restart-calls.json"].get("calls"), "restart-call"
@@ -2387,6 +2563,7 @@ class Driver:
             validate_operation_contracts(
                 restart_calls,
                 RESTART_OPERATION_CONTRACTS,
+                RESTART_OPERATION_SEQUENCE,
                 "restart transcript",
             )
             restart_operations = {cast(str, call["operation"]) for call in restart_calls}
@@ -2406,6 +2583,18 @@ class Driver:
                 or public_state.get("survived") is not True
             ):
                 raise AssertionError("restart evidence does not prove restart persistence")
+            restart_read = next(
+                call for call in restart_calls if call["operation"] == "crm.notes.after-restart"
+            )
+            restart_request = evidence_object(restart_read["request"], "restart-state request")
+            restart_fields = evidence_object(
+                restart_request["fields"], "restart-state request fields"
+            )
+            prepare = evidence["prepare-state.json"]
+            if public_state.get("noteId") != restart_fields.get(
+                "expectedNoteId"
+            ) or public_state.get("noteId") != prepare.get("noteId"):
+                raise AssertionError("restart state does not match the transcript")
             if not network_assertions or not all(
                 value is True for value in network_assertions.values()
             ):

@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -125,7 +126,12 @@ def valid_success_calls(*, cross_body_hash: str = "a" * 64) -> list[dict[str, ob
                 "scenarioId": "platform-contracts",
                 "version": 1,
             },
-            result={"status": 200, "randomSeed": 7},
+            result={
+                "status": 200,
+                "randomSeed": 7,
+                "scenarioEpoch": "epoch-success",
+                "manifestChecksum": "success-checksum",
+            },
         ),
         proof_call(
             "identity.token.issue",
@@ -160,7 +166,11 @@ def valid_success_calls(*, cross_body_hash: str = "a" * 64) -> list[dict[str, ob
             "relay.identity.retry",
             "POST",
             "/events",
-            request_fields={"virtualAdvance": "PT2S"},
+            request_fields={
+                "virtualAdvance": "PT2S",
+                "eventId": "evt-identity-retry",
+                "bodyHash": "e" * 64,
+            },
             result={"sameEventId": True, "sameBodyHash": True},
             response_status=204,
         ),
@@ -230,7 +240,7 @@ def valid_success_calls(*, cross_body_hash: str = "a" * 64) -> list[dict[str, ob
                 "expectedVersion": 1,
                 "bodyHash": "1" * 64,
             },
-            result={"status": 201, "replayed": False},
+            result={"status": 201, "replayed": False, "noteId": "note-saved"},
         ),
         proof_call(
             "crm.note.replay",
@@ -255,28 +265,48 @@ def valid_failure_calls() -> list[dict[str, object]]:
                 "scenarioId": "platform-contracts",
                 "version": 1,
             },
-            result={"status": 200, "randomSeed": 7},
+            result={
+                "status": 200,
+                "randomSeed": 7,
+                "scenarioEpoch": "epoch-before",
+                "manifestChecksum": "checksum",
+            },
         ),
         proof_call(
             "control.status.initial",
             "GET",
             "/control/v1/status",
-            result={"status": 200, "now": "2026-08-19T10:00:00Z", "randomSeed": 7},
+            result={
+                "status": 200,
+                "now": "2026-08-19T10:00:00Z",
+                "randomSeed": 7,
+                "scenarioEpoch": "epoch-before",
+                "manifestChecksum": "checksum",
+            },
         ),
-        *[
-            proof_call(
-                "identity.token.issue",
-                "POST",
-                "/oauth/token",
-                result={"status": 200, "tokenIssued": True},
-            )
-            for _ in range(3)
-        ],
+        proof_call(
+            "identity.token.issue",
+            "POST",
+            "/oauth/token",
+            result={"status": 200, "tokenIssued": True},
+        ),
+        proof_call(
+            "identity.token.issue",
+            "POST",
+            "/oauth/token",
+            result={"status": 200, "tokenIssued": True},
+        ),
         proof_call(
             "auth.missing",
             "GET",
             "/v1/customers",
             result={"status": 401, "error": {"code": "unauthenticated"}},
+        ),
+        proof_call(
+            "identity.token.issue",
+            "POST",
+            "/oauth/token",
+            result={"status": 200, "tokenIssued": True},
         ),
         proof_call(
             "auth.read-only-read",
@@ -403,7 +433,11 @@ def valid_failure_calls() -> list[dict[str, object]]:
             "control.fault-activations.before-reset",
             "GET",
             "/control/v1/fault-activations",
-            result={"status": 200, "activationCount": 1},
+            result={
+                "status": 200,
+                "activationCount": 1,
+                "ruleIds": ["crm-note-timeout-once"],
+            },
         ),
         proof_call(
             "identity.subscription.create",
@@ -455,13 +489,24 @@ def valid_failure_calls() -> list[dict[str, object]]:
                 "scenarioId": "platform-contracts",
                 "version": 1,
             },
-            result={"status": 200, "randomSeed": 7},
+            result={
+                "status": 200,
+                "randomSeed": 7,
+                "scenarioEpoch": "epoch-after",
+                "manifestChecksum": "checksum",
+            },
         ),
         proof_call(
             "control.status.after-reset",
             "GET",
             "/control/v1/status",
-            result={"status": 200, "now": "2026-08-19T10:00:00Z", "randomSeed": 7},
+            result={
+                "status": 200,
+                "now": "2026-08-19T10:00:00Z",
+                "randomSeed": 7,
+                "scenarioEpoch": "epoch-after",
+                "manifestChecksum": "checksum",
+            },
         ),
         proof_call(
             "identity.old-token.after-reset",
@@ -470,15 +515,12 @@ def valid_failure_calls() -> list[dict[str, object]]:
             request_fields={"tokenEpoch": "before-reset"},
             result={"status": 401, "error": {"code": "unauthenticated"}},
         ),
-        *[
-            proof_call(
-                "identity.token.issue",
-                "POST",
-                "/oauth/token",
-                result={"status": 200, "tokenIssued": True},
-            )
-            for _ in range(2)
-        ],
+        proof_call(
+            "identity.token.issue",
+            "POST",
+            "/oauth/token",
+            result={"status": 200, "tokenIssued": True},
+        ),
         proof_call(
             "identity.subscriptions.after-reset",
             "GET",
@@ -492,6 +534,12 @@ def valid_failure_calls() -> list[dict[str, object]]:
             "/v1/webhook-subscriptions",
             request_fields={"source": "crm"},
             result={"status": 200, "subscriptionCount": 0},
+        ),
+        proof_call(
+            "identity.token.issue",
+            "POST",
+            "/oauth/token",
+            result={"status": 200, "tokenIssued": True},
         ),
         proof_call(
             "crm.notes.after-reset",
@@ -602,6 +650,8 @@ def write_success_evidence(
     *,
     transcript_body_hash: str = "a" * 64,
     attempt_body_hash: str = "a" * 64,
+    retry_accepted_body_hash: str = "e" * 64,
+    prepare_note_id: str = "note-saved",
 ) -> None:
     write_run_file(
         root,
@@ -615,8 +665,22 @@ def write_success_evidence(
         "webhook-transcript.json",
         {
             "attempts": [
-                {"outcome": "unarmed"},
-                {"outcome": "accepted"},
+                {
+                    "eventId": "evt-identity-retry",
+                    "source": "identity",
+                    "eventType": "identity.token.issued",
+                    "bodyHash": "e" * 64,
+                    "outcome": "unarmed",
+                    "responseStatus": 503,
+                },
+                {
+                    "eventId": "evt-identity-retry",
+                    "source": "identity",
+                    "eventType": "identity.token.issued",
+                    "bodyHash": retry_accepted_body_hash,
+                    "outcome": "accepted",
+                    "responseStatus": 204,
+                },
                 {
                     "eventId": "evt_cross_subscription_signature",
                     "source": "crm",
@@ -636,6 +700,68 @@ def write_success_evidence(
             "wrongSignatureRejected": True,
         },
     )
+    write_run_file(
+        root,
+        run_id,
+        "prepare-state.json",
+        {
+            "scenarioEpoch": "epoch-success",
+            "manifestChecksum": "success-checksum",
+            "noteId": prepare_note_id,
+        },
+    )
+
+
+def valid_restart_calls(*, expected_note_id: str = "note-saved") -> list[dict[str, object]]:
+    return numbered(
+        [
+            proof_call(
+                "identity.token.issue",
+                "POST",
+                "/oauth/token",
+                result={"status": 200, "tokenIssued": True},
+            ),
+            proof_call(
+                "crm.notes.after-restart",
+                "GET",
+                "/v1/customers/cus_unique/notes",
+                request_fields={"expectedNoteId": expected_note_id},
+                result={"status": 200, "noteCount": 1, "savedNotePresent": True},
+            ),
+        ]
+    )
+
+
+def write_full_evidence(
+    root: Path,
+    run_id: str,
+    *,
+    restart_note_id: str = "note-saved",
+) -> None:
+    write_success_evidence(root, run_id)
+    write_failure_evidence(root, run_id, REQUIRED_FAILURE_OPERATIONS)
+    write_run_file(
+        root,
+        run_id,
+        "restart-calls.json",
+        {"calls": valid_restart_calls()},
+    )
+    write_run_file(
+        root,
+        run_id,
+        "restart.json",
+        {
+            "before": {"containerId": "container", "startedAt": "before"},
+            "after": {"containerId": "container", "startedAt": "after"},
+            "publicState": {"noteId": restart_note_id, "survived": True},
+        },
+    )
+    write_run_file(
+        root,
+        run_id,
+        "network.json",
+        {"assertions": {"conformanceIsolated": True}},
+    )
 
 
 def test_summary_rejects_run_bound_files_with_unproved_assertions(tmp_path: Path) -> None:
@@ -649,6 +775,7 @@ def test_summary_rejects_run_bound_files_with_unproved_assertions(tmp_path: Path
         "restart-calls.json",
         "restart.json",
         "network.json",
+        "prepare-state.json",
     ):
         write_run_file(tmp_path, run_id, name, {})
     driver = Driver.__new__(Driver)
@@ -736,6 +863,7 @@ def test_summary_rejects_structurally_incomplete_transcript(tmp_path: Path) -> N
             "wrongSignatureRejected": True,
         },
     )
+    write_run_file(tmp_path, run_id, "prepare-state.json", {})
     driver = Driver.__new__(Driver)
     driver.run_id = run_id
     driver.artifacts = tmp_path
@@ -784,6 +912,7 @@ def test_summary_rejects_success_without_cross_subscription_rejection(
             "wrongSignatureRejected": True,
         },
     )
+    write_run_file(tmp_path, run_id, "prepare-state.json", {})
     driver = Driver.__new__(Driver)
     driver.run_id = run_id
     driver.artifacts = tmp_path
@@ -843,6 +972,46 @@ def test_summary_requires_both_failure_resets(tmp_path: Path) -> None:
         driver.summarise("platform-failure")
 
 
+def test_summary_rejects_duplicated_first_reset_as_final_reset(tmp_path: Path) -> None:
+    run_id = "run-duplicated-first-reset"
+    calls = valid_failure_calls()
+    reset_indexes = [
+        index for index, call in enumerate(calls) if call["operation"] == "control.reset"
+    ]
+    second_sequence = calls[reset_indexes[1]]["sequence"]
+    calls[reset_indexes[1]] = deepcopy(calls[reset_indexes[0]])
+    calls[reset_indexes[1]]["sequence"] = second_sequence
+    write_failure_evidence(tmp_path, run_id, REQUIRED_FAILURE_OPERATIONS)
+    write_run_file(tmp_path, run_id, "failure-calls.json", {"calls": calls})
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"reset transcript.*evidence"):
+        driver.summarise("platform-failure")
+
+
+def test_summary_rejects_success_operations_out_of_workflow_order(tmp_path: Path) -> None:
+    run_id = "run-reordered-success"
+    calls = valid_success_calls()
+    identity_me = next(
+        index for index, call in enumerate(calls) if call["operation"] == "identity.me"
+    )
+    customer_search = next(
+        index for index, call in enumerate(calls) if call["operation"] == "crm.customer.search"
+    )
+    calls[identity_me], calls[customer_search] = calls[customer_search], calls[identity_me]
+    numbered(calls)
+    write_success_evidence(tmp_path, run_id)
+    write_run_file(tmp_path, run_id, "successful-calls.json", {"calls": calls})
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match="workflow order"):
+        driver.summarise("platform-success")
+
+
 def test_summary_rejects_semantically_empty_unchanged_state_records(
     tmp_path: Path,
 ) -> None:
@@ -882,6 +1051,74 @@ def test_summary_binds_cross_subscription_attempt_to_transcript_body(
 
     with pytest.raises(AssertionError, match=r"cross-subscription.*transcript"):
         driver.summarise("platform-success")
+
+
+def test_summary_binds_identity_retry_attempt_to_transcript_body(tmp_path: Path) -> None:
+    run_id = "run-unbound-identity-retry"
+    write_success_evidence(
+        tmp_path,
+        run_id,
+        retry_accepted_body_hash="d" * 64,
+    )
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"Identity retry.*transcript"):
+        driver.summarise("platform-success")
+
+
+def test_summary_binds_prepare_state_to_success_transcript(tmp_path: Path) -> None:
+    run_id = "run-unbound-prepare-state"
+    write_success_evidence(tmp_path, run_id, prepare_note_id="note-other")
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"prepare state.*transcript"):
+        driver.summarise("platform-success")
+
+
+def test_summary_binds_fault_activation_file_to_transcript(tmp_path: Path) -> None:
+    run_id = "run-unbound-fault-activation"
+    calls = valid_failure_calls()
+    activation_call = next(
+        call for call in calls if call["operation"] == "control.fault-activations.before-reset"
+    )
+    contradictory = {
+        "status": 200,
+        "activationCount": 1,
+        "ruleIds": ["different-rule"],
+    }
+    activation_call["response"] = {
+        "status": 200,
+        "body": contradictory,
+        "error": None,
+    }
+    activation_call["assertion"] = {
+        "expected": contradictory,
+        "actual": contradictory,
+        "outcome": "passed",
+    }
+    write_failure_evidence(tmp_path, run_id, REQUIRED_FAILURE_OPERATIONS)
+    write_run_file(tmp_path, run_id, "failure-calls.json", {"calls": calls})
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"fault activation.*transcript"):
+        driver.summarise("platform-failure")
+
+
+def test_summary_binds_restart_public_state_to_transcript(tmp_path: Path) -> None:
+    run_id = "run-unbound-restart-state"
+    write_full_evidence(tmp_path, run_id, restart_note_id="note-other")
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"restart state.*transcript"):
+        driver.summarise("platform-contracts")
 
 
 def test_summary_binds_operation_contract_to_response_status(tmp_path: Path) -> None:
