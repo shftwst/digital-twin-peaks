@@ -1,13 +1,15 @@
 import asyncio
+import json
 from datetime import UTC, datetime
 
 import pytest
-from httpx import ASGITransport, AsyncClient, HTTPStatusError
+from httpx import ASGITransport, AsyncClient, HTTPStatusError, MockTransport, Request, Response
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_twins.common.control.client import ControlClient
 from enterprise_twins.common.control.contracts import (
+    FaultDecision,
     FaultEffect,
     FaultPhase,
     FaultProbe,
@@ -164,6 +166,49 @@ async def test_evaluation_waits_for_a_concurrent_matching_rule_lock(
     decision = await evaluation
 
     assert decision.effect == FaultEffect.TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_concurrent_matching_probes_preserve_rule_priority_and_counts(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    await initialise_control(db)
+    repository = FaultRepository(db)
+    await repository.create(fault_rule(ruleId="rule-a", occurrence=2))
+    await repository.create(fault_rule(ruleId="rule-b"))
+
+    async with db() as locking_session:
+        await locking_session.begin()
+        await locking_session.scalar(
+            select(ScenarioState).where(ScenarioState.singleton_id == 1).with_for_update()
+        )
+        first_probe = asyncio.create_task(repository.evaluate(fault_probe(correlationId="first")))
+        second_probe = asyncio.create_task(repository.evaluate(fault_probe(correlationId="second")))
+        await wait_for_lock_waiters(db, 2, [first_probe, second_probe])
+        await locking_session.commit()
+
+    first, second = await asyncio.gather(first_probe, second_probe)
+    async with db() as session:
+        rules = {
+            rule.rule_id: rule
+            for rule in await session.scalars(select(FaultRule).order_by(FaultRule.rule_id))
+        }
+
+    assert sorted(decision.rule_id for decision in (first, second) if decision.rule_id) == [
+        "rule-a"
+    ]
+    assert sorted(decision.effect for decision in (first, second) if decision.effect) == [
+        FaultEffect.TIMEOUT
+    ]
+    assert rules["rule-a"].seen_count == 2
+    assert rules["rule-a"].remaining_count == 0
+    assert rules["rule-b"].seen_count == 0
+    assert rules["rule-b"].remaining_count == 1
+
+    fallback = await repository.evaluate(fault_probe(correlationId="third"))
+
+    assert fallback.rule_id == "rule-b"
+    assert fallback.effect == FaultEffect.TIMEOUT
 
 
 @pytest.mark.asyncio
@@ -394,6 +439,64 @@ async def test_fault_routes_enforce_roles_redact_tokens_and_client_serializes_pr
     for response in (denied_create, denied_diagnostics, denied_clear):
         assert "controller-secret-token" not in response.text
         assert "twin-secret-token" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_control_client_serializes_fault_probe_with_camel_case_keys() -> None:
+    captured: dict[str, object] = {}
+
+    def capture_request(request: Request) -> Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return Response(
+            200,
+            json={
+                "ruleId": "rule-a",
+                "effect": "timeout",
+                "delayMs": 250,
+                "responseData": {"reason": "configured"},
+            },
+        )
+
+    probe = fault_probe(
+        actorId="support-agent",
+        resourceId="case-1",
+        correlationId="correlation-1",
+        requestHash="a" * 64,
+    )
+    async with AsyncClient(transport=MockTransport(capture_request)) as http_client:
+        client = ControlClient("http://control.example", "twin-secret-token", http_client)
+        decision = await client.evaluate_fault(probe)
+
+    assert decision == FaultDecision(
+        ruleId="rule-a",
+        effect=FaultEffect.TIMEOUT,
+        delayMs=250,
+        responseData={"reason": "configured"},
+    )
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/control/v1/faults/evaluate"
+    assert captured["body"] == {
+        "targetService": "crm",
+        "operation": "crm.note.create",
+        "phase": "after_commit",
+        "actorId": "support-agent",
+        "resourceId": "case-1",
+        "correlationId": "correlation-1",
+        "requestHash": "a" * 64,
+    }
+    assert isinstance(captured["body"], dict)
+    assert (
+        not {
+            "target_service",
+            "actor_id",
+            "resource_id",
+            "correlation_id",
+            "request_hash",
+        }
+        & captured["body"].keys()
+    )
 
 
 @pytest.mark.asyncio
