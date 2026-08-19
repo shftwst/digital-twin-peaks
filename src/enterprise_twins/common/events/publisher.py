@@ -1,10 +1,14 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy.ext.asyncio import AsyncSession
+import httpx
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from enterprise_twins.common.db.records import AuditRecord, OutboxRecord
+from enterprise_twins.common.db.records import AuditRecord, OutboxRecord, ScenarioState
 from enterprise_twins.common.events.contracts import EventEnvelope
+from enterprise_twins.common.events.relay_client import RelayClient
+from enterprise_twins.common.http.errors import ApiError
 from enterprise_twins.common.ids import new_id
 
 
@@ -72,3 +76,39 @@ def record_event(
         )
     )
     return envelope
+
+
+class OutboxDispatcher:
+    def __init__(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        relay: RelayClient,
+    ) -> None:
+        self.factory = factory
+        self.relay = relay
+
+    async def run_once(self) -> int:
+        async with self.factory.begin() as session:
+            state = await session.get(ScenarioState, 1)
+            if state is None or state.mode != "active":
+                return 0
+            record = await session.scalar(
+                select(OutboxRecord)
+                .where(
+                    OutboxRecord.scenario_epoch == state.active_epoch,
+                    OutboxRecord.published.is_(False),
+                )
+                .order_by(OutboxRecord.event_id)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            if record is None:
+                return 0
+            record.publish_attempts += 1
+            try:
+                await self.relay.ingest(EventEnvelope.model_validate(record.envelope))
+            except ApiError, httpx.HTTPError:
+                return 0
+            record.published = True
+            record.published_at = datetime.now(UTC)
+            return 1
