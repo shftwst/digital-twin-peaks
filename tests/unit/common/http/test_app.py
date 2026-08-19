@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.testclient import TestClient
 
 from enterprise_twins.common.http.app import create_app
@@ -19,6 +19,11 @@ router = APIRouter()
 @router.get("/v1/failure")
 async def failure() -> None:
     raise ApiError(ErrorCode.CONFLICT, "version changed", status_code=409)
+
+
+@router.get("/v1/validated")
+async def validated(secret: str = Query(min_length=30)) -> dict[str, str]:
+    return {"secret": secret}
 
 
 client = TestClient(create_app("probe", ("probe:read",), ReadyStatus(), (router,)))
@@ -43,3 +48,22 @@ def test_error_envelope_and_response_metadata() -> None:
     assert response.json()["error"]["requestId"].startswith("req_")
     assert response.headers["X-Scenario-Epoch"] == "epoch_test"
     assert response.headers["X-Request-Id"].startswith("req_")
+
+
+def test_validation_errors_do_not_disclose_input_values() -> None:
+    response = client.get(
+        "/v1/validated",
+        params={"secret": "client-secret"},
+        headers={"X-Correlation-Id": "case-123"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert "client-secret" not in response.text
+    assert '"input"' not in response.text
+
+
+def test_unknown_business_route_uses_error_envelope() -> None:
+    response = client.get("/v1/missing", headers={"X-Correlation-Id": "case-123"})
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+    assert response.json()["error"]["requestId"].startswith("req_")
