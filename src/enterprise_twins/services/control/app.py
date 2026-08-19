@@ -15,14 +15,14 @@ class ControlStatus:
     async def current_epoch(self) -> str:
         try:
             return (await self.repository.state()).active_epoch
-        except OSError, RuntimeError, SQLAlchemyError:
+        except (OSError, RuntimeError, SQLAlchemyError):  # fmt: skip
             return "none"
 
     async def readiness(self) -> tuple[bool, dict[str, str]]:
         try:
             state = await self.repository.state()
             await self.repository.now()
-        except OSError, RuntimeError, SQLAlchemyError:
+        except (OSError, RuntimeError, SQLAlchemyError):  # fmt: skip
             return False, {"database": "not_ready", "clock": "not_ready"}
         ready = state.mode == "active"
         return ready, {"database": "ready", "clock": "ready", "scenario": state.mode}
