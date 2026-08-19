@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import delete, or_, select
@@ -21,9 +21,17 @@ class FaultRepository:
     def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
         self.factory = factory
 
+    async def lock_state(self, session: AsyncSession) -> ScenarioState | None:
+        return cast(
+            ScenarioState | None,
+            await session.scalar(
+                select(ScenarioState).where(ScenarioState.singleton_id == 1).with_for_update()
+            ),
+        )
+
     async def create(self, request: FaultRuleCreate) -> FaultRuleCreate:
         async with self.factory.begin() as session:
-            state = await session.get(ScenarioState, 1)
+            state = await self.lock_state(session)
             if state is None or state.mode != "active":
                 raise RuntimeError("scenario is not active")
             session.add(
@@ -49,7 +57,7 @@ class FaultRepository:
 
     async def evaluate(self, probe: FaultProbe) -> FaultDecision:
         async with self.factory.begin() as session:
-            state = await session.get(ScenarioState, 1)
+            state = await self.lock_state(session)
             clock = await session.get(VirtualClock, 1)
             if state is None or clock is None:
                 raise RuntimeError("control state is not initialised")
@@ -75,7 +83,7 @@ class FaultRepository:
                     ),
                 )
                 .order_by(FaultRule.rule_id)
-                .with_for_update(skip_locked=True)
+                .with_for_update()
                 .limit(1)
             )
             if rule is None:
@@ -105,6 +113,9 @@ class FaultRepository:
 
     async def clear(self) -> None:
         async with self.factory.begin() as session:
+            state = await self.lock_state(session)
+            if state is None:
+                raise RuntimeError("control state is not initialised")
             await session.execute(delete(FaultActivation))
             await session.execute(delete(FaultRule))
 

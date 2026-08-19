@@ -60,15 +60,15 @@ class FaultEffect(StrEnum):
 
 class FaultRuleCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
-    rule_id: str = Field(alias="ruleId")
-    target_service: str = Field(alias="targetService")
-    operation: str
+    rule_id: str = Field(alias="ruleId", max_length=120)
+    target_service: str = Field(alias="targetService", max_length=80)
+    operation: str = Field(max_length=160)
     phase: FaultPhase
     effect: FaultEffect
-    actor_id: str | None = Field(default=None, alias="actorId")
-    resource_id: str | None = Field(default=None, alias="resourceId")
-    correlation_id: str | None = Field(default=None, alias="correlationId")
-    request_hash: str | None = Field(default=None, alias="requestHash")
+    actor_id: str | None = Field(default=None, alias="actorId", max_length=128)
+    resource_id: str | None = Field(default=None, alias="resourceId", max_length=128)
+    correlation_id: str | None = Field(default=None, alias="correlationId", max_length=128)
+    request_hash: str | None = Field(default=None, alias="requestHash", max_length=64)
     occurrence: int = Field(default=1, ge=1)
     activation_count: int = Field(default=1, ge=1, alias="activationCount")
     delay_ms: int | None = Field(default=None, ge=0, alias="delayMs")
@@ -77,13 +77,13 @@ class FaultRuleCreate(BaseModel):
 
 class FaultProbe(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
-    target_service: str = Field(alias="targetService")
-    operation: str
+    target_service: str = Field(alias="targetService", max_length=80)
+    operation: str = Field(max_length=160)
     phase: FaultPhase
-    actor_id: str | None = Field(default=None, alias="actorId")
-    resource_id: str | None = Field(default=None, alias="resourceId")
-    correlation_id: str | None = Field(default=None, alias="correlationId")
-    request_hash: str | None = Field(default=None, alias="requestHash")
+    actor_id: str | None = Field(default=None, alias="actorId", max_length=128)
+    resource_id: str | None = Field(default=None, alias="resourceId", max_length=128)
+    correlation_id: str | None = Field(default=None, alias="correlationId", max_length=128)
+    request_hash: str | None = Field(default=None, alias="requestHash", max_length=64)
 
 
 class FaultDecision(BaseModel):
