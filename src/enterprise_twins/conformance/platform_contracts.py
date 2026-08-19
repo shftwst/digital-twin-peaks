@@ -1,12 +1,17 @@
 import argparse
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import subprocess
+from collections import Counter
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -28,6 +33,21 @@ FORBIDDEN_ARTEFACT_KEYS = {
     "client_secret",
     "secret",
     "x-twin-signature",
+}
+FORBIDDEN_NORMALISED_ARTEFACT_KEYS = {
+    "authorization",
+    "token",
+    "accesstoken",
+    "refreshtoken",
+    "idtoken",
+    "bearertoken",
+    "apitoken",
+    "authtoken",
+    "sessiontoken",
+    "jwt",
+    "clientsecret",
+    "secret",
+    "xtwinsignature",
 }
 FORBIDDEN_ARTEFACT_VALUES = {
     "support-secret",
@@ -84,6 +104,489 @@ REQUIRED_FAILURE_OPERATIONS = {
     "control.fault-activations.after-reset",
     "crm.note.idempotency-reuse.after-reset",
 }
+JWT_SHAPED_VALUE = re.compile(
+    r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]{8,})\."
+    r"([A-Za-z0-9_-]{8,})(?![A-Za-z0-9_-])"
+)
+INFER_RESPONSE_STATUS = object()
+
+
+@dataclass(frozen=True)
+class OperationContract:
+    count: int
+    method: str
+    path: str
+    request_fields: JsonObject
+    expected: JsonObject
+    actual: JsonObject
+    response_status: int | None
+    transport_error: str | None
+    required_request_keys: tuple[str, ...] = ()
+
+
+def operation_contract(
+    count: int,
+    method: str,
+    path: str,
+    *,
+    request_fields: JsonObject | None = None,
+    expected: JsonObject | None = None,
+    actual: JsonObject | None = None,
+    response_status: int | object | None = INFER_RESPONSE_STATUS,
+    transport_error: str | None = None,
+    required_request_keys: tuple[str, ...] = (),
+) -> OperationContract:
+    expected_fragment = expected or {}
+    actual_fragment = actual or {}
+    resolved_response_status: int | None
+    if response_status is INFER_RESPONSE_STATUS:
+        resolved_response_status = cast(
+            int,
+            actual_fragment.get("status", expected_fragment.get("status", 200)),
+        )
+    elif response_status is None or isinstance(response_status, int):
+        resolved_response_status = response_status
+    else:
+        raise TypeError("operation contract response status is invalid")
+    return OperationContract(
+        count=count,
+        method=method,
+        path=path,
+        request_fields=request_fields or {},
+        expected=expected_fragment,
+        actual=actual_fragment,
+        response_status=resolved_response_status,
+        transport_error=transport_error,
+        required_request_keys=required_request_keys,
+    )
+
+
+SUCCESS_OPERATION_CONTRACTS = {
+    "control.reset": operation_contract(
+        1,
+        "POST",
+        "/control/v1/reset",
+        request_fields={
+            "randomSeed": RANDOM_SEED,
+            "scenarioId": SCENARIO_ID,
+            "version": SCENARIO_VERSION,
+        },
+        expected={"status": 200, "randomSeed": RANDOM_SEED},
+        actual={"status": 200, "randomSeed": RANDOM_SEED},
+    ),
+    "identity.token.issue": operation_contract(
+        2,
+        "POST",
+        "/oauth/token",
+        expected={"status": 200, "tokenIssued": True},
+        actual={"status": 200, "tokenIssued": True},
+    ),
+    "identity.subscription.create": operation_contract(
+        1,
+        "POST",
+        "/v1/webhook-subscriptions",
+        request_fields={
+            "eventTypes": ["identity.token.issued"],
+            "targetHost": "webhook-receiver",
+        },
+        expected={"status": 201, "source": "identity"},
+        actual={"status": 201, "source": "identity"},
+    ),
+    "control.time.advance.identity-retry": operation_contract(
+        1,
+        "POST",
+        "/control/v1/time/advance",
+        request_fields={"duration": "PT2S"},
+        expected={"now": "2026-08-19T10:00:02Z"},
+        actual={"now": "2026-08-19T10:00:02Z"},
+    ),
+    "relay.identity.retry": operation_contract(
+        1,
+        "POST",
+        "/events",
+        request_fields={"virtualAdvance": "PT2S"},
+        expected={"sameEventId": True, "sameBodyHash": True},
+        actual={"sameEventId": True, "sameBodyHash": True},
+        response_status=204,
+    ),
+    "crm.subscription.create": operation_contract(
+        1,
+        "POST",
+        "/v1/webhook-subscriptions",
+        request_fields={
+            "eventTypes": ["crm.note.created"],
+            "targetHost": "webhook-receiver",
+        },
+        expected={"status": 201, "source": "crm"},
+        actual={"status": 201, "source": "crm"},
+    ),
+    "receiver.signature.cross-subscription-reject": operation_contract(
+        1,
+        "POST",
+        "/events",
+        request_fields={
+            "eventId": "evt_cross_subscription_signature",
+            "envelopeSource": "crm",
+            "eventType": "crm.note.created",
+            "signingSecretSource": "identity",
+        },
+        expected={
+            "status": 401,
+            "error": {"code": "unauthenticated"},
+            "accepted": False,
+        },
+        actual={
+            "status": 401,
+            "error": {"code": "unauthenticated"},
+            "accepted": False,
+        },
+        required_request_keys=("bodyHash",),
+    ),
+    "receiver.signature.zero-reject": operation_contract(
+        1,
+        "POST",
+        "/events",
+        request_fields={"source": "crm", "eventType": "crm.note.created"},
+        expected={"status": 401, "accepted": False},
+        actual={"status": 401, "accepted": False},
+        required_request_keys=("bodyHash",),
+    ),
+    "identity.me": operation_contract(
+        1,
+        "GET",
+        "/v1/me",
+        expected={"subject": "person-support-1"},
+        actual={"subject": "person-support-1"},
+    ),
+    "crm.customer.search": operation_contract(
+        1,
+        "GET",
+        "/v1/customers",
+        expected={"customerIds": ["cus_unique"]},
+        actual={"customerIds": ["cus_unique"]},
+        required_request_keys=("emailHash",),
+    ),
+    "crm.customer.get": operation_contract(
+        1,
+        "GET",
+        "/v1/customers/cus_unique",
+        expected={"customerId": "cus_unique", "version": 1},
+        actual={"customerId": "cus_unique", "version": 1},
+    ),
+    "crm.note.create": operation_contract(
+        1,
+        "POST",
+        "/v1/customers/cus_unique/notes",
+        request_fields={"association": "account", "expectedVersion": 1},
+        expected={"status": 201, "replayed": False},
+        actual={"status": 201, "replayed": False},
+        required_request_keys=("bodyHash",),
+    ),
+    "crm.note.replay": operation_contract(
+        1,
+        "POST",
+        "/v1/customers/cus_unique/notes",
+        request_fields={"sameIdempotencyKey": True, "sameBodyHash": True},
+        expected={"sameNoteId": True, "replayed": True},
+        actual={"sameNoteId": True, "replayed": True},
+        response_status=201,
+    ),
+}
+
+
+FAILURE_OPERATION_CONTRACTS = {
+    "control.reset": operation_contract(
+        2,
+        "POST",
+        "/control/v1/reset",
+        request_fields={
+            "randomSeed": RANDOM_SEED,
+            "scenarioId": SCENARIO_ID,
+            "version": SCENARIO_VERSION,
+        },
+        expected={"status": 200, "randomSeed": RANDOM_SEED},
+        actual={"status": 200, "randomSeed": RANDOM_SEED},
+    ),
+    "control.status.initial": operation_contract(
+        1,
+        "GET",
+        "/control/v1/status",
+        expected={"status": 200, "now": INITIAL_TIME, "randomSeed": RANDOM_SEED},
+        actual={"status": 200, "now": INITIAL_TIME, "randomSeed": RANDOM_SEED},
+    ),
+    "identity.token.issue": operation_contract(
+        5,
+        "POST",
+        "/oauth/token",
+        expected={"status": 200, "tokenIssued": True},
+        actual={"status": 200, "tokenIssued": True},
+    ),
+    "auth.missing": operation_contract(
+        1,
+        "GET",
+        "/v1/customers",
+        expected={"status": 401, "error": {"code": "unauthenticated"}},
+        actual={"status": 401, "error": {"code": "unauthenticated"}},
+    ),
+    "auth.read-only-read": operation_contract(
+        1,
+        "GET",
+        "/v1/customers/cus_unique",
+        request_fields={"actorClass": "read-only"},
+        expected={"status": 200, "customerId": "cus_unique"},
+        actual={"status": 200, "customerId": "cus_unique"},
+    ),
+    "auth.read-only-write": operation_contract(
+        1,
+        "POST",
+        "/v1/customers/cus_unique/notes",
+        request_fields={"actorClass": "read-only", "expectedVersion": 1},
+        expected={"status": 403, "error": {"code": "forbidden"}},
+        actual={"status": 403, "error": {"code": "forbidden"}},
+    ),
+    "crm.notes.after-read-only-denial": operation_contract(
+        1,
+        "GET",
+        "/v1/customers/cus_unique/notes",
+        expected={"noteCount": 0, "rejectedBodyPresent": False},
+        actual={"noteCount": 0, "rejectedBodyPresent": False},
+        required_request_keys=("rejectedBodyHash",),
+    ),
+    "crm.search.ambiguous": operation_contract(
+        1,
+        "GET",
+        "/v1/customers",
+        expected={"customerIds": ["cus_ambiguous_a", "cus_ambiguous_b"]},
+        actual={"customerIds": ["cus_ambiguous_a", "cus_ambiguous_b"]},
+        required_request_keys=("emailHash",),
+    ),
+    "crm.note.precondition.stale": operation_contract(
+        1,
+        "POST",
+        "/v1/customers/cus_unique/notes",
+        request_fields={"keyLabel": "reused-after-reset", "expectedVersion": 0},
+        expected={"status": 409},
+        actual={"status": 409, "error": {"code": "conflict"}},
+    ),
+    "crm.note.create.idempotency-baseline": operation_contract(
+        1,
+        "POST",
+        "/v1/customers/cus_unique/notes",
+        request_fields={"keyLabel": "reused-after-reset", "expectedVersion": 1},
+        expected={"status": 201, "replayed": False},
+        actual={"status": 201, "replayed": False},
+        required_request_keys=("bodyHash",),
+    ),
+    "crm.note.idempotency-mismatch": operation_contract(
+        1,
+        "POST",
+        "/v1/customers/cus_unique/notes",
+        request_fields={"keyLabel": "reused-after-reset"},
+        expected={"status": 409},
+        actual={"status": 409, "error": {"code": "conflict"}},
+        required_request_keys=("bodyHash",),
+    ),
+    "crm.notes.after-idempotency-denial": operation_contract(
+        1,
+        "GET",
+        "/v1/customers/cus_unique/notes",
+        expected={
+            "noteCount": 1,
+            "validNoteCount": 1,
+            "validNoteIdMatches": True,
+            "forbiddenBodyPresent": False,
+            "changedBodyPresent": False,
+        },
+        actual={
+            "noteCount": 1,
+            "validNoteCount": 1,
+            "validNoteIdMatches": True,
+            "forbiddenBodyPresent": False,
+            "changedBodyPresent": False,
+        },
+        required_request_keys=("validNoteId", "forbiddenBodyHash", "changedBodyHash"),
+    ),
+    "webhook.target.denied": operation_contract(
+        1,
+        "POST",
+        "/v1/webhook-subscriptions",
+        request_fields={"targetHost": "127.0.0.1"},
+        expected={"status": 422},
+        actual={"status": 422, "error": {"code": "invalid_request"}},
+    ),
+    "control.fault.create": operation_contract(
+        1,
+        "POST",
+        "/control/v1/faults",
+        request_fields={
+            "ruleId": "crm-note-timeout-once",
+            "targetService": "crm",
+            "phase": "after_commit",
+            "delayMs": 500,
+        },
+        expected={"status": 201, "ruleId": "crm-note-timeout-once"},
+        actual={"status": 201, "ruleId": "crm-note-timeout-once"},
+    ),
+    "crm.customer.before-timeout": operation_contract(
+        1,
+        "GET",
+        "/v1/customers/cus_unique",
+        expected={"status": 200, "customerId": "cus_unique"},
+        actual={"status": 200, "customerId": "cus_unique"},
+    ),
+    "crm.note.after-commit-timeout": operation_contract(
+        1,
+        "POST",
+        "/v1/customers/cus_unique/notes",
+        request_fields={"clientReadTimeoutMs": 100, "serverDelayMs": 500},
+        expected={"error": "ReadTimeout"},
+        actual={"error": "ReadTimeout"},
+        response_status=None,
+        transport_error="ReadTimeout",
+        required_request_keys=("bodyHash",),
+    ),
+    "crm.note.timeout.read": operation_contract(
+        1,
+        "GET",
+        "/v1/customers/cus_unique/notes",
+        expected={"status": 200, "noteCount": 2, "timeoutNoteCount": 1},
+        actual={"status": 200, "noteCount": 2, "timeoutNoteCount": 1},
+        required_request_keys=("bodyHash",),
+    ),
+    "crm.note.timeout.replay": operation_contract(
+        1,
+        "POST",
+        "/v1/customers/cus_unique/notes",
+        request_fields={"sameIdempotencyKey": True},
+        expected={"status": 201, "sameNoteId": True, "replayed": True},
+        actual={"status": 201, "sameNoteId": True, "replayed": True},
+    ),
+    "control.fault-activations.before-reset": operation_contract(
+        1,
+        "GET",
+        "/control/v1/fault-activations",
+        expected={"status": 200, "activationCount": 1},
+        actual={"status": 200, "activationCount": 1},
+    ),
+    "identity.subscription.create": operation_contract(
+        1,
+        "POST",
+        "/v1/webhook-subscriptions",
+        request_fields={
+            "eventTypes": ["identity.token.issued"],
+            "targetHost": "webhook-receiver",
+        },
+        expected={"status": 201, "source": "identity"},
+        actual={"status": 201, "source": "identity"},
+    ),
+    "crm.subscription.create": operation_contract(
+        1,
+        "POST",
+        "/v1/webhook-subscriptions",
+        request_fields={
+            "eventTypes": ["crm.note.created"],
+            "targetHost": "webhook-receiver",
+        },
+        expected={"status": 201, "source": "crm"},
+        actual={"status": 201, "source": "crm"},
+    ),
+    "identity.subscriptions.before-reset": operation_contract(
+        1,
+        "GET",
+        "/v1/webhook-subscriptions",
+        request_fields={"source": "identity"},
+        expected={"status": 200, "subscriptionCount": 1},
+        actual={"status": 200, "subscriptionCount": 1},
+    ),
+    "crm.subscriptions.before-reset": operation_contract(
+        1,
+        "GET",
+        "/v1/webhook-subscriptions",
+        request_fields={"source": "crm"},
+        expected={"status": 200, "subscriptionCount": 1},
+        actual={"status": 200, "subscriptionCount": 1},
+    ),
+    "control.time.advance.pre-reset": operation_contract(
+        1,
+        "POST",
+        "/control/v1/time/advance",
+        request_fields={"duration": "PT5M"},
+        expected={"status": 200, "now": "2026-08-19T10:05:00Z"},
+        actual={"status": 200, "now": "2026-08-19T10:05:00Z"},
+    ),
+    "control.status.after-reset": operation_contract(
+        1,
+        "GET",
+        "/control/v1/status",
+        expected={"status": 200, "now": INITIAL_TIME, "randomSeed": RANDOM_SEED},
+        actual={"status": 200, "now": INITIAL_TIME, "randomSeed": RANDOM_SEED},
+    ),
+    "identity.old-token.after-reset": operation_contract(
+        1,
+        "GET",
+        "/v1/me",
+        request_fields={"tokenEpoch": "before-reset"},
+        expected={"status": 401, "error": {"code": "unauthenticated"}},
+        actual={"status": 401, "error": {"code": "unauthenticated"}},
+    ),
+    "identity.subscriptions.after-reset": operation_contract(
+        1,
+        "GET",
+        "/v1/webhook-subscriptions",
+        request_fields={"source": "identity"},
+        expected={"status": 200, "subscriptionCount": 0},
+        actual={"status": 200, "subscriptionCount": 0},
+    ),
+    "crm.subscriptions.after-reset": operation_contract(
+        1,
+        "GET",
+        "/v1/webhook-subscriptions",
+        request_fields={"source": "crm"},
+        expected={"status": 200, "subscriptionCount": 0},
+        actual={"status": 200, "subscriptionCount": 0},
+    ),
+    "crm.notes.after-reset": operation_contract(
+        1,
+        "GET",
+        "/v1/customers/cus_unique/notes",
+        expected={"status": 200, "noteCount": 0},
+        actual={"status": 200, "noteCount": 0},
+    ),
+    "control.fault-activations.after-reset": operation_contract(
+        1,
+        "GET",
+        "/control/v1/fault-activations",
+        expected={"status": 200, "activationCount": 0},
+        actual={"status": 200, "activationCount": 0},
+    ),
+    "crm.note.idempotency-reuse.after-reset": operation_contract(
+        1,
+        "POST",
+        "/v1/customers/cus_unique/notes",
+        request_fields={"keyLabel": "reused-after-reset", "expectedVersion": 1},
+        expected={"status": 201, "replayed": False},
+        actual={"status": 201, "replayed": False},
+    ),
+}
+
+
+RESTART_OPERATION_CONTRACTS = {
+    "identity.token.issue": operation_contract(
+        1,
+        "POST",
+        "/oauth/token",
+        expected={"status": 200, "tokenIssued": True},
+        actual={"status": 200, "tokenIssued": True},
+    ),
+    "crm.notes.after-restart": operation_contract(
+        1,
+        "GET",
+        "/v1/customers/cus_unique/notes",
+        expected={"status": 200, "savedNotePresent": True},
+        actual={"status": 200, "savedNotePresent": True},
+        required_request_keys=("expectedNoteId",),
+    ),
+}
 
 
 def object_body(response: httpx.Response) -> JsonObject:
@@ -91,6 +594,19 @@ def object_body(response: httpx.Response) -> JsonObject:
     if not isinstance(value, dict):
         raise AssertionError("expected a JSON object response")
     return cast(JsonObject, value)
+
+
+def contains_jwt_shaped_value(value: str) -> bool:
+    for candidate in JWT_SHAPED_VALUE.finditer(value):
+        encoded_header = candidate.group(1)
+        padding = "=" * (-len(encoded_header) % 4)
+        try:
+            header = json.loads(base64.urlsafe_b64decode(encoded_header + padding))
+        except binascii.Error, json.JSONDecodeError, UnicodeDecodeError, ValueError:
+            continue
+        if isinstance(header, dict) and ("alg" in header or "typ" in header):
+            return True
+    return False
 
 
 def list_body(response: httpx.Response) -> list[JsonObject]:
@@ -123,14 +639,24 @@ def safe_error(response: httpx.Response) -> JsonObject:
 def check_no_sensitive_values(value: object) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            if key.casefold() in FORBIDDEN_ARTEFACT_KEYS:
+            normalised_key = "".join(
+                character for character in key.casefold() if character.isalnum()
+            )
+            if (
+                key.casefold() in FORBIDDEN_ARTEFACT_KEYS
+                or normalised_key in FORBIDDEN_NORMALISED_ARTEFACT_KEYS
+            ):
                 raise AssertionError(f"artefact contains forbidden key: {key}")
             check_no_sensitive_values(item)
     elif isinstance(value, list):
         for item in value:
             check_no_sensitive_values(item)
     elif isinstance(value, str):
-        if value.startswith("Bearer ") or value in FORBIDDEN_ARTEFACT_VALUES:
+        if (
+            "bearer " in value.casefold()
+            or contains_jwt_shaped_value(value)
+            or any(secret in value for secret in FORBIDDEN_ARTEFACT_VALUES)
+        ):
             raise AssertionError("artefact contains a credential value")
 
 
@@ -225,6 +751,55 @@ def validate_transcript(value: object, name: str) -> list[JsonObject]:
     for sequence, record in enumerate(calls, start=1):
         validate_transcript_record(record, expected_sequence=sequence, name=name)
     return calls
+
+
+def validate_operation_contracts(
+    calls: list[JsonObject],
+    contracts: dict[str, OperationContract],
+    name: str,
+) -> None:
+    counts = Counter(cast(str, call["operation"]) for call in calls)
+    expected_counts = Counter(
+        {operation: contract.count for operation, contract in contracts.items()}
+    )
+    if counts != expected_counts:
+        differences = [
+            f"{operation} expected {expected_counts[operation]}, observed {counts[operation]}"
+            for operation in sorted(set(counts) | set(expected_counts))
+            if counts[operation] != expected_counts[operation]
+        ]
+        raise AssertionError(
+            f"{name} operation contract multiplicity differs: {', '.join(differences)}"
+        )
+    for call in calls:
+        operation = cast(str, call["operation"])
+        contract = contracts[operation]
+        request = evidence_object(call["request"], f"{operation} request")
+        fields = evidence_object(request["fields"], f"{operation} request fields")
+        response = evidence_object(call["response"], f"{operation} response")
+        assertion = evidence_object(call["assertion"], f"{operation} assertion")
+        missing_request_keys = set(contract.required_request_keys) - set(fields)
+        hash_values_valid = all(
+            not key.casefold().endswith("hash")
+            or (
+                isinstance(fields[key], str)
+                and re.fullmatch(r"[0-9a-f]{64}", fields[key]) is not None
+            )
+            for key in contract.required_request_keys
+            if key in fields
+        )
+        if (
+            request["method"] != contract.method
+            or request["path"] != contract.path
+            or response["status"] != contract.response_status
+            or response["error"] != contract.transport_error
+            or missing_request_keys
+            or not hash_values_valid
+            or not expected_matches(contract.request_fields, fields)
+            or not expected_matches(contract.expected, assertion["expected"])
+            or not expected_matches(contract.actual, assertion["actual"])
+        ):
+            raise AssertionError(f"{operation} operation contract differs from evidence")
 
 
 def run_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
@@ -612,6 +1187,7 @@ class Driver:
             method="POST",
             path="/events",
             request_fields={
+                "eventId": event_id,
                 "envelopeSource": "crm",
                 "eventType": "crm.note.created",
                 "signingSecretSource": "identity",
@@ -1711,33 +2287,26 @@ class Driver:
                 raise AssertionError(
                     f"successful transcript omits required operations: {sorted(missing_success)}"
                 )
+            validate_operation_contracts(
+                successful,
+                SUCCESS_OPERATION_CONTRACTS,
+                "successful transcript",
+            )
             cross_calls = [
                 call
                 for call in successful
                 if call["operation"] == "receiver.signature.cross-subscription-reject"
             ]
-            if len(cross_calls) != 1 or not expected_matches(
-                {
-                    "request": {
-                        "fields": {
-                            "envelopeSource": "crm",
-                            "eventType": "crm.note.created",
-                            "signingSecretSource": "identity",
-                        }
-                    },
-                    "response": {"status": 401},
-                    "assertion": {
-                        "actual": {
-                            "status": 401,
-                            "error": {"code": "unauthenticated"},
-                            "accepted": False,
-                        }
-                    },
-                },
-                cross_calls[0] if cross_calls else {},
-            ):
+            cross_request = evidence_object(cross_calls[0]["request"], "cross-subscription request")
+            cross_fields = evidence_object(
+                cross_request["fields"], "cross-subscription request fields"
+            )
+            cross_attempt = cross_attempts[0]
+            if cross_fields.get("eventId") != cross_attempt.get("eventId") or cross_fields.get(
+                "bodyHash"
+            ) != cross_attempt.get("bodyHash"):
                 raise AssertionError(
-                    "successful transcript does not prove cross-subscription secret binding"
+                    "cross-subscription receiver attempt does not match the transcript"
                 )
         if mode in {"platform-failure", "platform-contracts"}:
             failures = validate_transcript(
@@ -1759,6 +2328,11 @@ class Driver:
                 raise AssertionError(
                     f"failure transcript omits required operations: {sorted(missing_failure)}"
                 )
+            validate_operation_contracts(
+                failures,
+                FAILURE_OPERATION_CONTRACTS,
+                "failure transcript",
+            )
             activations = evidence_list(
                 evidence["fault-activations.json"].get("activations"), "fault activation"
             )
@@ -1809,6 +2383,11 @@ class Driver:
         if mode == "platform-contracts":
             restart_calls = validate_transcript(
                 evidence["restart-calls.json"].get("calls"), "restart-call"
+            )
+            validate_operation_contracts(
+                restart_calls,
+                RESTART_OPERATION_CONTRACTS,
+                "restart transcript",
             )
             restart_operations = {cast(str, call["operation"]) for call in restart_calls}
             if not {"identity.token.issue", "crm.notes.after-restart"}.issubset(restart_operations):
