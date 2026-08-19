@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Integer, String
+from sqlalchemy import BigInteger, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -13,6 +13,18 @@ class VirtualClock(Base):
 
     singleton_id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     now: Mapped[datetime] = mapped_column(Timestamp, nullable=False)
+
+
+class ResetRun(Base):
+    __tablename__ = "reset_runs"
+    reset_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    scenario_id: Mapped[str] = mapped_column(String(80), index=True)
+    scenario_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    random_seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    scenario_epoch: Mapped[str] = mapped_column(String(64), unique=True)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    manifest_checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    error: Mapped[str | None] = mapped_column(String(500))
 
 
 class FaultRule(ScenarioOwned, Base):

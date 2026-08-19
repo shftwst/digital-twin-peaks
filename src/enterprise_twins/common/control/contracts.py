@@ -92,3 +92,44 @@ class FaultDecision(BaseModel):
     effect: FaultEffect | None = None
     delay_ms: int | None = Field(default=None, alias="delayMs")
     response_data: dict[str, Any] = Field(default_factory=dict, alias="responseData")
+
+
+class ResetRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    scenario_id: str = Field(alias="scenarioId")
+    version: int = Field(ge=1)
+    random_seed: int | None = Field(
+        default=None,
+        alias="randomSeed",
+        ge=0,
+        le=9_223_372_036_854_775_807,
+    )
+
+
+class ParticipantLoadRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    scenario_epoch: str = Field(alias="scenarioEpoch")
+    scenario_id: str = Field(alias="scenarioId")
+    scenario_version: int = Field(alias="scenarioVersion")
+    random_seed: int = Field(alias="randomSeed")
+    payload: dict[str, Any]
+    checksum: str
+
+
+class ParticipantReport(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    service: str
+    schema_version: str = Field(alias="schemaVersion")
+    counts: dict[str, int]
+    aliases: dict[str, str] = Field(default_factory=dict)
+    checksum: str
+
+
+class ResetResult(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    scenario_id: str = Field(alias="scenarioId")
+    version: int
+    random_seed: int = Field(alias="randomSeed")
+    scenario_epoch: str = Field(alias="scenarioEpoch")
+    manifest_checksum: str = Field(alias="manifestChecksum")
+    reports: list[ParticipantReport]
