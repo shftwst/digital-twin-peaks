@@ -11,6 +11,7 @@ from enterprise_twins.common.events.contracts import (
 )
 from enterprise_twins.common.events.relay_client import RelayClient
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
+from enterprise_twins.common.http.etag import parse_quoted_version
 from enterprise_twins.services.identity.issuer import TokenIssuer
 from enterprise_twins.services.identity.repository import IdentityRepository
 from enterprise_twins.services.identity.settings import IdentitySettings
@@ -129,6 +130,7 @@ def identity_router(
             Header(alias="Idempotency-Key", min_length=1, max_length=200),
         ],
     ) -> None:
+        expected_version = parse_quoted_version(if_match, minimum=1)
         if relay is None:
             raise ApiError(
                 ErrorCode.TEMPORARILY_UNAVAILABLE,
@@ -136,16 +138,6 @@ def identity_router(
                 status_code=503,
                 retryable=True,
             )
-        try:
-            expected_version = int(if_match.strip('"'))
-            if expected_version < 1:
-                raise ValueError
-        except ValueError as error:
-            raise ApiError(
-                ErrorCode.INVALID_REQUEST,
-                "If-Match is invalid",
-                status_code=422,
-            ) from error
         await relay.delete_subscription(
             principal.subject,
             idempotency_key,

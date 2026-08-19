@@ -10,7 +10,9 @@ from enterprise_twins.services.crm.schemas import (
     NotePage,
     NoteView,
     decode_cursor,
+    decode_note_cursor,
     encode_cursor,
+    encode_note_cursor,
 )
 
 
@@ -122,7 +124,13 @@ class CustomerRepository:
                 )
             return customer_view(customer)
 
-    async def list_notes(self, customer_id: str, include_archived: bool) -> NotePage:
+    async def list_notes(
+        self,
+        customer_id: str,
+        include_archived: bool,
+        limit: int,
+        after: str | None,
+    ) -> NotePage:
         async with self.factory() as session:
             epoch = await self.active_epoch(session)
             customer_exists = await session.scalar(
@@ -143,7 +151,46 @@ class CustomerRepository:
             )
             if not include_archived:
                 statement = statement.where(CustomerNote.archived.is_(False))
-            notes = await session.scalars(
-                statement.order_by(CustomerNote.created_at, CustomerNote.note_id)
+            if after is not None:
+                try:
+                    created_at, note_id = decode_note_cursor(
+                        after,
+                        customer_id,
+                        include_archived,
+                        epoch,
+                        self.cursor_secret,
+                    )
+                except (ValueError, KeyError, TypeError) as error:
+                    raise ApiError(
+                        ErrorCode.INVALID_REQUEST,
+                        "pagination cursor is invalid",
+                        status_code=422,
+                    ) from error
+                statement = statement.where(
+                    (CustomerNote.created_at > created_at)
+                    | ((CustomerNote.created_at == created_at) & (CustomerNote.note_id > note_id))
+                )
+            rows = list(
+                await session.scalars(
+                    statement.order_by(CustomerNote.created_at, CustomerNote.note_id).limit(
+                        limit + 1
+                    )
+                )
             )
-            return NotePage(items=[note_view(item) for item in notes])
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            return NotePage(
+                items=[note_view(item) for item in rows],
+                nextCursor=(
+                    encode_note_cursor(
+                        customer_id,
+                        include_archived,
+                        epoch,
+                        rows[-1].created_at,
+                        rows[-1].note_id,
+                        self.cursor_secret,
+                    )
+                    if has_more and rows
+                    else None
+                ),
+            )

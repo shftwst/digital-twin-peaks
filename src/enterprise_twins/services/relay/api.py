@@ -11,6 +11,7 @@ from enterprise_twins.common.events.contracts import (
     WebhookSubscriptionView,
 )
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
+from enterprise_twins.common.http.etag import parse_quoted_version
 from enterprise_twins.services.relay.repository import RelayRepository
 from enterprise_twins.services.relay.settings import RelaySettings
 
@@ -74,14 +75,7 @@ def relay_router(
         authorization: Annotated[str | None, Header()] = None,
     ) -> None:
         authorise(source, authorization)
-        try:
-            expected_version = int(if_match.strip('"'))
-            if expected_version < 1:
-                raise ValueError
-        except ValueError as error:
-            raise ApiError(
-                ErrorCode.INVALID_REQUEST, "If-Match is invalid", status_code=422
-            ) from error
+        expected_version = parse_quoted_version(if_match, minimum=1)
         await repository.delete_subscription(
             source,
             caller_id,

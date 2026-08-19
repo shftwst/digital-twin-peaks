@@ -190,5 +190,3 @@ class CrmService:
 async def apply_post_commit_fault(result: NoteWriteResult) -> None:
     if result.fault.effect == FaultEffect.TIMEOUT:
         await asyncio.sleep((result.fault.delay_ms or 250) / 1000)
-    elif result.fault.effect == FaultEffect.CONNECTION_LOSS:
-        raise ConnectionResetError("injected after-commit connection loss")

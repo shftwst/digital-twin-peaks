@@ -30,11 +30,16 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
     ) -> Response:
         request_id = new_id("req")
         correlation_id = request.headers.get("X-Correlation-Id")
+        correlation_error: str | None = None
         if request.url.path.startswith("/v1/") and not correlation_id:
+            correlation_error = "X-Correlation-Id is required"
+        elif correlation_id is not None and len(correlation_id) > 128:
+            correlation_error = "X-Correlation-Id is too long"
+        if correlation_error is not None:
             body = ErrorEnvelope(
                 error=ErrorBody(
                     code=ErrorCode.INVALID_REQUEST,
-                    message="X-Correlation-Id is required",
+                    message=correlation_error,
                     requestId=request_id,
                 )
             )

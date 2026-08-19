@@ -1,13 +1,21 @@
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Protocol
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from starlette.requests import ClientDisconnect
+from starlette.types import ASGIApp, Message, Scope
 
+from enterprise_twins.common.canonical import canonical_json
 from enterprise_twins.common.control.contracts import FaultDecision, FaultEffect
 from enterprise_twins.common.control.participant import ResetParticipant
 from enterprise_twins.common.db.records import (
@@ -27,6 +35,7 @@ class ControlState(Protocol):
 
 
 class CrmHarness(Protocol):
+    app: ASGIApp
     client: AsyncClient
     support_headers: dict[str, str]
     future_epoch_headers: dict[str, str]
@@ -73,6 +82,64 @@ async def advisory_gate(
             yield
         finally:
             await session.commit()
+
+
+def encode_segment(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+
+def signed_note_cursor(payload: dict[str, object]) -> str:
+    body = canonical_json(payload)
+    signature = hmac.new(b"crm-test-cursor", body, hashlib.sha256).digest()
+    return f"{encode_segment(body)}.{encode_segment(signature)}"
+
+
+async def invoke_note_create(
+    app: ASGIApp,
+    headers: dict[str, str],
+    payload: dict[str, str],
+) -> tuple[list[Message], BaseException | None]:
+    request_sent = False
+
+    async def receive() -> Message:
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {
+                "type": "http.request",
+                "body": json.dumps(payload).encode(),
+                "more_body": False,
+            }
+        return {"type": "http.disconnect"}
+
+    messages: list[Message] = []
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/customers/cus_unique/notes",
+        "raw_path": b"/v1/customers/cus_unique/notes",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (name.lower().encode(), value.encode())
+            for name, value in (headers | {"Content-Type": "application/json"}).items()
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("crm", 8000),
+    }
+    failure: BaseException | None = None
+    try:
+        await app(scope, receive, send)
+    except (ConnectionResetError, ClientDisconnect, ExceptionGroup) as error:
+        failure = error
+    return messages, failure
 
 
 @pytest.mark.asyncio
@@ -221,6 +288,48 @@ async def test_stale_customer_version_and_missing_scope_do_not_create_notes(
 
 
 @pytest.mark.asyncio
+async def test_note_create_rejects_noncanonical_if_match_before_business_work(
+    crm_client: AsyncClient,
+    support_headers: dict[str, str],
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    invalid_values = ["1", '""1""', "+1", "-1", ' "1" ', '"01"']
+    for index, value in enumerate(invalid_values):
+        response = await crm_client.post(
+            "/v1/customers/cus_unique/notes",
+            headers=support_headers
+            | {"Idempotency-Key": f"invalid-etag-{index}", "If-Match": value},
+            json={"body": "must not commit", "association": "account"},
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "invalid_request"
+
+    assert await count(db, CustomerNote) == 1
+    assert await count(db, IdempotencyRecord) == 0
+    assert await count(db, OutboxRecord) == 0
+    async with db() as session:
+        customer = await session.scalar(
+            select(Customer).where(Customer.customer_id == "cus_unique")
+        )
+    assert customer is not None
+    assert customer.version == 1
+
+
+@pytest.mark.asyncio
+async def test_webhook_delete_validates_if_match_before_relay_availability(
+    crm_client: AsyncClient,
+    support_headers: dict[str, str],
+) -> None:
+    response = await crm_client.delete(
+        "/v1/webhook-subscriptions/sub_absent",
+        headers=support_headers | {"Idempotency-Key": "invalid-proxy-etag", "If-Match": "1"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.asyncio
 async def test_note_write_requires_local_active_mode_and_matching_control_epoch(
     crm_harness: CrmHarness,
     db: async_sessionmaker[AsyncSession],
@@ -340,6 +449,232 @@ async def test_after_commit_malformed_response_replays_the_committed_result(
     assert await count(db, CustomerNote) == 2
     assert await count(db, IdempotencyRecord) == 1
     assert await count(db, OutboxRecord) == 1
+
+
+@pytest.mark.asyncio
+async def test_after_commit_connection_loss_starts_response_and_retry_replays_commit(
+    crm_harness: CrmHarness,
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    crm_harness.control.decision = FaultDecision(effect=FaultEffect.CONNECTION_LOSS)
+    headers = crm_harness.support_headers | {
+        "Idempotency-Key": "note-connection-loss",
+        "If-Match": '"1"',
+    }
+    messages, failure = await invoke_note_create(
+        crm_harness.app,
+        headers,
+        {"body": "committed before disconnect", "association": "account"},
+    )
+
+    assert failure is not None
+    starts = [message for message in messages if message["type"] == "http.response.start"]
+    assert len(starts) == 1
+    assert starts[0]["status"] == 201
+
+    crm_harness.control.decision = FaultDecision()
+    replay = await crm_harness.client.post(
+        "/v1/customers/cus_unique/notes",
+        headers=headers,
+        json={"body": "committed before disconnect", "association": "account"},
+    )
+
+    assert replay.status_code == 201
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json()["body"] == "committed before disconnect"
+    assert await count(db, CustomerNote) == 2
+    assert await count(db, IdempotencyRecord) == 1
+    assert await count(db, OutboxRecord) == 1
+    async with db() as session:
+        customer = await session.scalar(
+            select(Customer).where(Customer.customer_id == "cus_unique")
+        )
+    assert customer is not None
+    assert customer.version == 2
+
+
+@pytest.mark.asyncio
+async def test_note_pagination_uses_stable_timestamp_and_note_id_boundary(
+    crm_client: AsyncClient,
+    support_headers: dict[str, str],
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    shared_time = datetime(2026, 8, 19, 9, tzinfo=UTC)
+    async with db.begin() as session:
+        session.add_all(
+            [
+                CustomerNote(
+                    row_id=f"nrow_page_{note_id}",
+                    note_id=note_id,
+                    scenario_epoch=epoch,
+                    customer_id="cus_unique",
+                    body=note_id,
+                    association="account",
+                    created_by="person-support-1",
+                    created_at=created_at,
+                    archived=False,
+                    version=1,
+                )
+                for note_id, created_at, epoch in [
+                    ("note_a", shared_time, "epoch_1"),
+                    ("note_b", shared_time, "epoch_1"),
+                    ("note_c", shared_time.replace(hour=10), "epoch_1"),
+                    ("note_old_same_customer", shared_time, "epoch_old"),
+                ]
+            ]
+        )
+
+    first = await crm_client.get(
+        "/v1/customers/cus_unique/notes",
+        params={"limit": 1},
+        headers=support_headers,
+    )
+    second = await crm_client.get(
+        "/v1/customers/cus_unique/notes",
+        params={"limit": 1, "after": first.json()["nextCursor"]},
+        headers=support_headers,
+    )
+    third = await crm_client.get(
+        "/v1/customers/cus_unique/notes",
+        params={"limit": 1, "after": second.json()["nextCursor"]},
+        headers=support_headers,
+    )
+
+    assert [first.status_code, second.status_code, third.status_code] == [200, 200, 200]
+    assert [
+        first.json()["items"][0]["noteId"],
+        second.json()["items"][0]["noteId"],
+        third.json()["items"][0]["noteId"],
+    ] == ["note_a", "note_b", "note_c"]
+    assert first.json()["nextCursor"] is not None
+    assert second.json()["nextCursor"] is not None
+    assert third.json()["nextCursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_note_cursor_rejects_tampering_noncanonical_data_and_cross_list_reuse(
+    crm_client: AsyncClient,
+    support_headers: dict[str, str],
+) -> None:
+    valid_payload: dict[str, object] = {
+        "kind": "crm-note-list",
+        "customerId": "cus_unique",
+        "includeArchived": False,
+        "scenarioEpoch": "epoch_1",
+        "createdAt": "2026-08-19T09:00:00Z",
+        "noteId": "note_a",
+    }
+    valid = signed_note_cursor(valid_payload)
+    payload_part, signature_part = valid.split(".")
+    changed_signature = signature_part[:-1] + ("A" if signature_part[-1] != "A" else "B")
+    invalid = [
+        f"{payload_part}*.{signature_part}",
+        f"{valid}.extra",
+        f"{payload_part}.{signature_part}=",
+        f"{payload_part}.{changed_signature}",
+        signed_note_cursor({"customerId": "cus_unique"}),
+        signed_note_cursor(valid_payload | {"includeArchived": "false"}),
+    ]
+    for cursor in invalid:
+        response = await crm_client.get(
+            "/v1/customers/cus_unique/notes",
+            params={"after": cursor},
+            headers=support_headers,
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "invalid_request"
+
+    other_customer = await crm_client.get(
+        "/v1/customers/cus_ambiguous_a/notes",
+        params={"after": valid},
+        headers=support_headers,
+    )
+    changed_filter = await crm_client.get(
+        "/v1/customers/cus_unique/notes",
+        params={"after": valid, "includeArchived": True},
+        headers=support_headers,
+    )
+    assert other_customer.status_code == changed_filter.status_code == 422
+    assert other_customer.json()["error"]["code"] == "invalid_request"
+    assert changed_filter.json()["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_note_cursor_cannot_cross_a_scenario_epoch(
+    crm_client: AsyncClient,
+    support_headers: dict[str, str],
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with db.begin() as session:
+        session.add_all(
+            [
+                CustomerNote(
+                    row_id=f"nrow_cursor_{note_id}",
+                    note_id=note_id,
+                    scenario_epoch="epoch_1",
+                    customer_id="cus_unique",
+                    body=note_id,
+                    association="account",
+                    created_by="person-support-1",
+                    created_at=created_at,
+                    archived=False,
+                    version=1,
+                )
+                for note_id, created_at in [
+                    ("note_cursor_a", datetime(2026, 8, 19, 9, tzinfo=UTC)),
+                    ("note_cursor_b", datetime(2026, 8, 19, 10, tzinfo=UTC)),
+                ]
+            ]
+        )
+    first = await crm_client.get(
+        "/v1/customers/cus_unique/notes",
+        params={"limit": 1},
+        headers=support_headers,
+    )
+    cursor = first.json()["nextCursor"]
+    assert cursor is not None
+
+    async with db.begin() as session:
+        state = await session.get(ScenarioState, 1, with_for_update=True)
+        assert state is not None
+        state.active_epoch = "epoch_2"
+        session.add(
+            Customer(
+                row_id="crow_epoch_2",
+                scenario_epoch="epoch_2",
+                customer_id="cus_unique",
+                display_name="Epoch two customer",
+                primary_email="epoch2@example.test",
+                external_reference="ext-epoch-2",
+                account_status="active",
+                contact_methods=[],
+                external_identifiers={},
+                version=1,
+            )
+        )
+        session.add(
+            CustomerNote(
+                row_id="nrow_epoch_2",
+                note_id="note_epoch_2",
+                scenario_epoch="epoch_2",
+                customer_id="cus_unique",
+                body="new epoch",
+                association="account",
+                created_by="person-support-1",
+                created_at=datetime(2026, 8, 19, 11, tzinfo=UTC),
+                archived=False,
+                version=1,
+            )
+        )
+
+    reused = await crm_client.get(
+        "/v1/customers/cus_unique/notes",
+        params={"after": cursor},
+        headers=support_headers,
+    )
+
+    assert reused.status_code == 422
+    assert reused.json()["error"]["code"] == "invalid_request"
 
 
 @pytest.mark.asyncio

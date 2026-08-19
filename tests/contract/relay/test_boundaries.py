@@ -162,6 +162,29 @@ async def test_source_routes_enforce_roles_redact_tokens_and_replay_original_sec
 
 
 @pytest.mark.asyncio
+async def test_relay_delete_rejects_noncanonical_if_match_before_repository_work(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=relay_app(db, repository)),
+        base_url="http://relay",
+    ) as client:
+        for index, value in enumerate(["1", '""1""', "+1", "-1", ' "1" ', '"01"']):
+            response = await client.delete(
+                "/internal/v1/sources/crm/subscriptions/sub_absent",
+                headers={
+                    "Authorization": "Bearer crm-source-secret",
+                    "Idempotency-Key": f"relay-etag-{index}",
+                    "X-Caller-Id": "person-support-1",
+                    "If-Match": value,
+                },
+            )
+            assert response.status_code == 422
+            assert response.json()["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.asyncio
 async def test_changed_event_body_returns_common_conflict_envelope(
     db: async_sessionmaker[AsyncSession],
 ) -> None:

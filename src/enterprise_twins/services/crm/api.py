@@ -1,7 +1,8 @@
+from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Query, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from enterprise_twins.common.auth.claims import Principal
 from enterprise_twins.common.auth.verifier import BearerAuthenticator, require_scopes
@@ -13,6 +14,7 @@ from enterprise_twins.common.events.contracts import (
 )
 from enterprise_twins.common.events.relay_client import RelayClient
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
+from enterprise_twins.common.http.etag import parse_quoted_version
 from enterprise_twins.services.crm.repository import CustomerRepository
 from enterprise_twins.services.crm.schemas import (
     CustomerPage,
@@ -21,6 +23,11 @@ from enterprise_twins.services.crm.schemas import (
     NotePage,
 )
 from enterprise_twins.services.crm.service import CrmService, apply_post_commit_fault
+
+
+async def connection_loss_body() -> AsyncIterator[bytes]:
+    raise ConnectionResetError("injected after-commit connection loss")
+    yield b""  # pragma: no cover
 
 
 def crm_router(
@@ -77,8 +84,15 @@ def crm_router(
         customer_id: str,
         _principal: ReadPrincipal,
         include_archived: bool = Query(default=False, alias="includeArchived"),
+        limit: int = Query(default=50, ge=1, le=100),
+        after: str | None = None,
     ) -> NotePage:
-        return await repository.list_notes(customer_id, include_archived)
+        return await repository.list_notes(
+            customer_id,
+            include_archived,
+            limit,
+            after,
+        )
 
     @router.post("/v1/customers/{customer_id}/notes")
     async def create_note(
@@ -91,14 +105,7 @@ def crm_router(
         ],
         if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=20)],
     ) -> Response:
-        try:
-            expected_version = int(if_match.strip('"'))
-        except ValueError as error:
-            raise ApiError(
-                ErrorCode.INVALID_REQUEST,
-                "If-Match is invalid",
-                status_code=422,
-            ) from error
+        expected_version = parse_quoted_version(if_match)
         result = await service.create_note(
             customer_id,
             body,
@@ -106,12 +113,19 @@ def crm_router(
             idempotency_key,
             principal,
         )
-        await apply_post_commit_fault(result)
-        if result.fault.effect == FaultEffect.MALFORMED_RESPONSE:
-            return Response(content=b"{", status_code=200, media_type="application/json")
         headers = result.response.headers | {
             "Idempotency-Replayed": str(result.replayed).lower(),
         }
+        if result.fault.effect == FaultEffect.CONNECTION_LOSS:
+            return StreamingResponse(
+                connection_loss_body(),
+                status_code=result.response.status_code,
+                headers=headers,
+                media_type="application/json",
+            )
+        await apply_post_commit_fault(result)
+        if result.fault.effect == FaultEffect.MALFORMED_RESPONSE:
+            return Response(content=b"{", status_code=200, media_type="application/json")
         return JSONResponse(
             result.response.body,
             status_code=result.response.status_code,
@@ -170,6 +184,7 @@ def crm_router(
         ],
         if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=20)],
     ) -> None:
+        expected_version = parse_quoted_version(if_match, minimum=1)
         if relay is None:
             raise ApiError(
                 ErrorCode.TEMPORARILY_UNAVAILABLE,
@@ -177,16 +192,6 @@ def crm_router(
                 status_code=503,
                 retryable=True,
             )
-        try:
-            expected_version = int(if_match.strip('"'))
-            if expected_version < 1:
-                raise ValueError
-        except ValueError as error:
-            raise ApiError(
-                ErrorCode.INVALID_REQUEST,
-                "If-Match is invalid",
-                status_code=422,
-            ) from error
         await relay.delete_subscription(
             principal.subject,
             idempotency_key,

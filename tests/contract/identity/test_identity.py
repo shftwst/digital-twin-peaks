@@ -3,6 +3,7 @@
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
+import httpx
 import jwt
 import pytest
 import pytest_asyncio
@@ -14,6 +15,7 @@ from enterprise_twins.common.canonical import sha256_hex
 from enterprise_twins.common.control.contracts import FaultDecision, ParticipantLoadRequest
 from enterprise_twins.common.control.participant import ResetParticipant
 from enterprise_twins.common.db.records import AuditRecord, OutboxRecord, ScenarioState
+from enterprise_twins.common.events.relay_client import RelayClient
 from enterprise_twins.services.identity import repository as repository_module
 from enterprise_twins.services.identity.app import IdentityStatus, create_identity_app
 from enterprise_twins.services.identity.models import IdentityClient
@@ -177,6 +179,75 @@ async def test_wrong_secret_and_ungranted_scope_are_denied(
     assert excessive.status_code == 403
     assert "wrong" not in wrong.text
     assert "support-secret" not in excessive.text
+
+
+@pytest.mark.asyncio
+async def test_webhook_delete_rejects_noncanonical_if_match_before_relay_work(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = IdentitySettings(
+        database_url="postgresql+asyncpg://unused",
+        issuer="http://identity:8000",
+        audience="enterprise-twins",
+        signing_seed="identity-test-signing-seed",
+        secret_pepper="identity-test-pepper",
+        token_ttl_seconds=600,
+    )
+    async with db.begin() as session:
+        session.add(ScenarioState(singleton_id=1, mode="active", active_epoch="epoch_1"))
+        session.add(
+            IdentityClient(
+                row_id="irow_webhook",
+                scenario_epoch="epoch_1",
+                client_id="webhook-manager",
+                secret_digest=digest_secret(
+                    "webhook-manager", "manager-secret", settings.secret_pepper
+                ),
+                subject="person-support-1",
+                actor_type="human",
+                role="support_agent",
+                scopes=["webhooks:manage"],
+                tenant_id="tenant_synthetic",
+                active=True,
+                version=1,
+            )
+        )
+    relay_requests: list[httpx.Request] = []
+
+    async def relay_response(request: httpx.Request) -> httpx.Response:
+        relay_requests.append(request)
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(relay_response)) as relay_http:
+        relay = RelayClient("http://relay", "identity", "source-secret", relay_http)
+        app = create_identity_app(db, settings, Clock(), relay)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://identity:8000"
+        ) as client:
+            token_response = await client.post(
+                "/oauth/token",
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": "webhook-manager",
+                    "client_secret": "manager-secret",
+                    "scope": "webhooks:manage",
+                },
+            )
+            token = token_response.json()["access_token"]
+            for index, value in enumerate(["1", '""1""', "+1", "-1", ' "1" ', '"01"']):
+                response = await client.delete(
+                    "/v1/webhook-subscriptions/sub_1",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-Correlation-Id": "case-identity-etag",
+                        "Idempotency-Key": f"identity-etag-{index}",
+                        "If-Match": value,
+                    },
+                )
+                assert response.status_code == 422
+                assert response.json()["error"]["code"] == "invalid_request"
+
+    assert relay_requests == []
 
 
 @pytest.mark.asyncio

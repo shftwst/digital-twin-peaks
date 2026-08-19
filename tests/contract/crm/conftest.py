@@ -9,6 +9,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from starlette.types import ASGIApp
 
 from enterprise_twins.common.auth.verifier import JwtVerifier
 from enterprise_twins.common.control.contracts import FaultDecision, FaultProbe
@@ -39,6 +40,7 @@ class Control:
 
 @dataclass
 class Harness:
+    app: ASGIApp
     client: AsyncClient
     support_headers: dict[str, str]
     read_only_headers: dict[str, str]
@@ -169,6 +171,7 @@ async def crm_harness(
         base_url="http://crm:8000",
     ) as client:
         yield Harness(
+            app,
             client,
             {
                 "Authorization": f"Bearer {support_token}",

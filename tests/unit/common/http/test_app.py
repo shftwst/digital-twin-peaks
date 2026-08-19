@@ -26,6 +26,11 @@ async def validated(secret: str = Query(min_length=30)) -> dict[str, str]:
     return {"secret": secret}
 
 
+@router.get("/oauth/probe")
+async def oauth_probe() -> dict[str, str]:
+    return {"status": "reachable"}
+
+
 client = TestClient(create_app("probe", ("probe:read",), ReadyStatus(), (router,)))
 
 
@@ -39,6 +44,15 @@ def test_business_request_requires_correlation_id() -> None:
     response = client.get("/v1/failure")
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_supplied_correlation_id_is_bounded_on_v1_and_other_application_paths() -> None:
+    for path in ("/v1/failure", "/oauth/probe"):
+        response = client.get(path, headers={"X-Correlation-Id": "c" * 129})
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_request"
+        assert response.json()["error"]["requestId"].startswith("req_")
+        assert response.headers["X-Scenario-Epoch"] == "epoch_test"
 
 
 def test_error_envelope_and_response_metadata() -> None:
