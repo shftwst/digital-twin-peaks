@@ -136,7 +136,7 @@ def valid_success_calls(*, cross_body_hash: str = "a" * 64) -> list[dict[str, ob
                 "status": 200,
                 "randomSeed": 7,
                 "scenarioEpoch": "epoch-success",
-                "manifestChecksum": "success-checksum",
+                "manifestChecksum": "checksum",
             },
         ),
         proof_call(
@@ -326,7 +326,11 @@ def valid_failure_calls() -> list[dict[str, object]]:
             "auth.read-only-write",
             "POST",
             "/v1/customers/cus_unique/notes",
-            request_fields={"actorClass": "read-only", "expectedVersion": 1},
+            request_fields={
+                "actorClass": "read-only",
+                "expectedVersion": 1,
+                "bodyHash": "b" * 64,
+            },
             result={"status": 403, "error": {"code": "forbidden"}},
         ),
         proof_call(
@@ -359,7 +363,7 @@ def valid_failure_calls() -> list[dict[str, object]]:
                 "expectedVersion": 1,
                 "bodyHash": "c" * 64,
             },
-            result={"status": 201, "replayed": False},
+            result={"status": 201, "replayed": False, "noteId": "note-valid"},
         ),
         proof_call(
             "crm.note.idempotency-mismatch",
@@ -373,7 +377,7 @@ def valid_failure_calls() -> list[dict[str, object]]:
             "GET",
             "/v1/customers/cus_unique/notes",
             request_fields={
-                "validNoteId": "note_valid",
+                "validNoteId": "note-valid",
                 "forbiddenBodyHash": "b" * 64,
                 "changedBodyHash": "d" * 64,
             },
@@ -444,6 +448,17 @@ def valid_failure_calls() -> list[dict[str, object]]:
                 "status": 200,
                 "activationCount": 1,
                 "ruleIds": ["crm-note-timeout-once"],
+                "activations": [
+                    {
+                        "activationId": "activation-timeout",
+                        "ruleId": "crm-note-timeout-once",
+                        "operation": "crm.note.create",
+                        "phase": "after_commit",
+                        "effect": "timeout",
+                        "correlationId": "case-platform-failures",
+                        "activatedAt": "2026-08-19T10:00:00Z",
+                    }
+                ],
             },
         ),
         proof_call(
@@ -454,7 +469,11 @@ def valid_failure_calls() -> list[dict[str, object]]:
                 "eventTypes": ["identity.token.issued"],
                 "targetHost": "webhook-receiver",
             },
-            result={"status": 201, "source": "identity"},
+            result={
+                "status": 201,
+                "source": "identity",
+                "subscriptionId": "sub-identity",
+            },
         ),
         proof_call(
             "crm.subscription.create",
@@ -464,21 +483,29 @@ def valid_failure_calls() -> list[dict[str, object]]:
                 "eventTypes": ["crm.note.created"],
                 "targetHost": "webhook-receiver",
             },
-            result={"status": 201, "source": "crm"},
+            result={"status": 201, "source": "crm", "subscriptionId": "sub-crm"},
         ),
         proof_call(
             "identity.subscriptions.before-reset",
             "GET",
             "/v1/webhook-subscriptions",
             request_fields={"source": "identity"},
-            result={"status": 200, "subscriptionCount": 1},
+            result={
+                "status": 200,
+                "subscriptionCount": 1,
+                "subscriptionIds": ["sub-identity"],
+            },
         ),
         proof_call(
             "crm.subscriptions.before-reset",
             "GET",
             "/v1/webhook-subscriptions",
             request_fields={"source": "crm"},
-            result={"status": 200, "subscriptionCount": 1},
+            result={
+                "status": 200,
+                "subscriptionCount": 1,
+                "subscriptionIds": ["sub-crm"],
+            },
         ),
         proof_call(
             "control.time.advance.pre-reset",
@@ -646,7 +673,19 @@ def write_failure_evidence(
         root,
         run_id,
         "fault-activations.json",
-        {"activations": [{"ruleId": "crm-note-timeout-once"}]},
+        {
+            "activations": [
+                {
+                    "activationId": "activation-timeout",
+                    "ruleId": "crm-note-timeout-once",
+                    "operation": "crm.note.create",
+                    "phase": "after_commit",
+                    "effect": "timeout",
+                    "correlationId": "case-platform-failures",
+                    "activatedAt": "2026-08-19T10:00:00Z",
+                }
+            ]
+        },
     )
     write_run_file(root, run_id, "reset-checksums.json", reset or valid_reset_evidence())
 
@@ -673,6 +712,7 @@ def write_success_evidence(
         {
             "attempts": [
                 {
+                    "sequence": 1,
                     "eventId": "evt-identity-retry",
                     "source": "identity",
                     "eventType": "identity.token.issued",
@@ -682,6 +722,7 @@ def write_success_evidence(
                     "responseStatus": 503,
                 },
                 {
+                    "sequence": 2,
                     "eventId": "evt-identity-retry",
                     "source": "identity",
                     "eventType": "identity.token.issued",
@@ -691,14 +732,17 @@ def write_success_evidence(
                     "responseStatus": 204,
                 },
                 {
+                    "sequence": 3,
                     "eventId": "evt_cross_subscription_signature",
                     "source": "crm",
                     "eventType": "crm.note.created",
+                    "correlationId": "case-cross-subscription-signature",
                     "bodyHash": attempt_body_hash,
                     "outcome": "signature_rejected",
                     "responseStatus": 401,
                 },
                 {
+                    "sequence": 4,
                     "eventId": "evt_deliberate_bad_signature",
                     "source": "crm",
                     "eventType": "crm.note.created",
@@ -708,6 +752,7 @@ def write_success_evidence(
                     "responseStatus": 401,
                 },
                 {
+                    "sequence": 5,
                     "eventId": "evt-crm-note",
                     "source": "crm",
                     "eventType": "crm.note.created",
@@ -719,6 +764,7 @@ def write_success_evidence(
             ],
             "acceptedEvents": [
                 {
+                    "sequence": 2,
                     "eventId": "evt-identity-retry",
                     "source": "identity",
                     "eventType": "identity.token.issued",
@@ -729,6 +775,7 @@ def write_success_evidence(
                     "signatureValid": True,
                 },
                 {
+                    "sequence": 5,
                     "eventId": "evt-crm-note",
                     "source": "crm",
                     "eventType": "crm.note.created",
@@ -755,7 +802,7 @@ def write_success_evidence(
         "prepare-state.json",
         {
             "scenarioEpoch": "epoch-success",
-            "manifestChecksum": "success-checksum",
+            "manifestChecksum": "checksum",
             "noteId": prepare_note_id,
         },
     )
@@ -800,8 +847,14 @@ def write_full_evidence(
         run_id,
         "restart.json",
         {
-            "before": {"containerId": "container", "startedAt": "before"},
-            "after": {"containerId": "container", "startedAt": "after"},
+            "before": {
+                "containerId": "container",
+                "startedAt": "2026-08-19T10:00:00Z",
+            },
+            "after": {
+                "containerId": "container",
+                "startedAt": "2026-08-19T10:01:00Z",
+            },
             "publicState": {"noteId": restart_note_id, "survived": True},
         },
     )
@@ -809,8 +862,390 @@ def write_full_evidence(
         root,
         run_id,
         "network.json",
-        {"assertions": {"conformanceIsolated": True}},
+        {
+            "composeNetworks": {
+                "webhook-receiver": ["conformance-admin", "twin-webhook-egress"],
+                "conformance": ["conformance-admin", "twin-control", "twin-public"],
+                "public-probe": ["twin-public"],
+            },
+            "runtimeNetworks": {
+                "webhook-receiver": ["conformance-admin", "twin-webhook-egress"],
+                "conformance": ["conformance-admin", "twin-control", "twin-public"],
+                "public-probe": ["twin-public"],
+            },
+            "hostBindings": {
+                "webhook-receiver": {},
+                "conformance": {},
+                "public-probe": {},
+            },
+            "assertions": {
+                "controlNotPublished": True,
+                "conformanceHasNoDatabaseUrl": True,
+                "dockerSocketAbsent": True,
+                "driverOffWebhookEgress": True,
+                "receiverOffControl": True,
+                "publicProbeCannotResolveControl": True,
+            },
+        },
     )
+
+
+def driver_for(root: Path, run_id: str) -> Driver:
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = root
+    return driver
+
+
+def call_for(calls: list[dict[str, object]], operation: str) -> dict[str, object]:
+    return next(call for call in calls if call["operation"] == operation)
+
+
+@pytest.mark.parametrize(
+    ("section", "service", "replacement"),
+    [
+        (
+            "composeNetworks",
+            "conformance",
+            ["conformance-admin", "twin-control", "twin-public", "twin-webhook-egress"],
+        ),
+        (
+            "runtimeNetworks",
+            "conformance",
+            ["conformance-admin", "twin-control", "twin-public", "twin-webhook-egress"],
+        ),
+        (
+            "hostBindings",
+            "conformance",
+            {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "18000"}]},
+        ),
+        ("assertions", "receiverOffControl", 1),
+    ],
+)
+def test_summary_rejects_network_evidence_mutation(
+    tmp_path: Path,
+    section: str,
+    service: str,
+    replacement: object,
+) -> None:
+    run_id = "run-network-mutation"
+    write_full_evidence(tmp_path, run_id)
+    network = read_run_body(tmp_path, "network.json")
+    values = network[section]
+    assert isinstance(values, dict)
+    values[service] = replacement
+    write_run_file(tmp_path, run_id, "network.json", network)
+
+    with pytest.raises(AssertionError, match="network evidence"):
+        driver_for(tmp_path, run_id).summarise("platform-contracts")
+
+
+@pytest.mark.parametrize("collection", ["attempts", "acceptedEvents"])
+def test_summary_rejects_duplicate_receiver_sequence(
+    tmp_path: Path,
+    collection: str,
+) -> None:
+    run_id = f"run-duplicate-{collection}"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    records = webhook[collection]
+    assert isinstance(records, list)
+    first = records[0]
+    second = records[1]
+    assert isinstance(first, dict)
+    assert isinstance(second, dict)
+    second["sequence"] = first["sequence"]
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+
+    with pytest.raises(AssertionError, match="sequence"):
+        driver_for(tmp_path, run_id).summarise("platform-success")
+
+
+def test_summary_rejects_boolean_receiver_sequence(tmp_path: Path) -> None:
+    run_id = "run-boolean-attempt-sequence"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    attempts = webhook["attempts"]
+    assert isinstance(attempts, list)
+    first = attempts[0]
+    assert isinstance(first, dict)
+    first["sequence"] = True
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+
+    with pytest.raises(AssertionError, match="sequence"):
+        driver_for(tmp_path, run_id).summarise("platform-success")
+
+
+def test_summary_allows_legitimate_matched_extra_webhook_traffic(tmp_path: Path) -> None:
+    run_id = "run-extra-matched-webhook"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    attempts = webhook["attempts"]
+    accepted_events = webhook["acceptedEvents"]
+    assert isinstance(attempts, list)
+    assert isinstance(accepted_events, list)
+    extra = {
+        "sequence": 6,
+        "eventId": "evt-manager-race",
+        "source": "identity",
+        "eventType": "identity.token.issued",
+        "correlationId": "case-manager-before-subscription",
+        "bodyHash": "8" * 64,
+        "outcome": "accepted",
+        "responseStatus": 204,
+    }
+    attempts.append(extra)
+    accepted_events.append(extra | {"signatureValid": True})
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+
+    driver_for(tmp_path, run_id).summarise("platform-success")
+
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "passed"
+
+
+def test_summary_rejects_matched_extra_with_boolean_response_status(tmp_path: Path) -> None:
+    run_id = "run-extra-boolean-status"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    attempts = webhook["attempts"]
+    accepted_events = webhook["acceptedEvents"]
+    assert isinstance(attempts, list)
+    assert isinstance(accepted_events, list)
+    extra = {
+        "sequence": 6,
+        "eventId": "evt-manager-race",
+        "source": "identity",
+        "eventType": "identity.token.issued",
+        "correlationId": "case-manager-before-subscription",
+        "bodyHash": "8" * 64,
+        "outcome": "accepted",
+        "responseStatus": True,
+    }
+    attempts.append(extra)
+    accepted_events.append(extra | {"signatureValid": True})
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+
+    with pytest.raises(AssertionError, match="response status"):
+        driver_for(tmp_path, run_id).summarise("platform-success")
+
+
+@pytest.mark.parametrize(
+    "selected_correlation",
+    [
+        "case-identity-unarmed-retry",
+        "case-platform-success",
+        "case-cross-subscription-signature",
+        "case-bad-signature",
+    ],
+)
+def test_summary_rejects_changed_selected_webhook_correlation(
+    tmp_path: Path,
+    selected_correlation: str,
+) -> None:
+    run_id = "run-changed-selected-correlation"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    for collection in ("attempts", "acceptedEvents"):
+        records = webhook[collection]
+        assert isinstance(records, list)
+        for record in records:
+            assert isinstance(record, dict)
+            if record.get("correlationId") == selected_correlation:
+                record["correlationId"] = "case-unbound"
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+
+    with pytest.raises(AssertionError, match=r"correlation|CRM workflow"):
+        driver_for(tmp_path, run_id).summarise("platform-success")
+
+
+@pytest.mark.parametrize(
+    ("operation", "field", "replacement"),
+    [
+        ("crm.notes.after-idempotency-denial", "validNoteId", "note-other"),
+        ("crm.note.timeout.read", "bodyHash", "0" * 64),
+        ("crm.notes.after-read-only-denial", "rejectedBodyHash", "0" * 64),
+        ("crm.notes.after-idempotency-denial", "forbiddenBodyHash", "0" * 64),
+        ("crm.notes.after-idempotency-denial", "changedBodyHash", "0" * 64),
+    ],
+)
+def test_summary_rejects_unbound_failure_request_observation(
+    tmp_path: Path,
+    operation: str,
+    field: str,
+    replacement: str,
+) -> None:
+    run_id = "run-unbound-failure-observation"
+    write_failure_evidence(tmp_path, run_id, REQUIRED_FAILURE_OPERATIONS)
+    evidence = read_run_body(tmp_path, "failure-calls.json")
+    calls = evidence["calls"]
+    assert isinstance(calls, list)
+    record = call_for(calls, operation)
+    request = record["request"]
+    assert isinstance(request, dict)
+    fields = request["fields"]
+    assert isinstance(fields, dict)
+    fields[field] = replacement
+    write_run_file(tmp_path, run_id, "failure-calls.json", evidence)
+
+    with pytest.raises(AssertionError, match="failure evidence"):
+        driver_for(tmp_path, run_id).summarise("platform-failure")
+
+
+@pytest.mark.parametrize("source", ["identity", "crm"])
+def test_summary_rejects_listed_subscription_id_that_was_not_created(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    run_id = f"run-{source}-subscription-mismatch"
+    write_failure_evidence(tmp_path, run_id, REQUIRED_FAILURE_OPERATIONS)
+    evidence = read_run_body(tmp_path, "failure-calls.json")
+    calls = evidence["calls"]
+    assert isinstance(calls, list)
+    record = call_for(calls, f"{source}.subscriptions.before-reset")
+    assertion = record["assertion"]
+    response = record["response"]
+    assert isinstance(assertion, dict)
+    assert isinstance(response, dict)
+    for body in (assertion["actual"], assertion["expected"], response["body"]):
+        assert isinstance(body, dict)
+        body["subscriptionIds"] = ["sub-unbound"]
+    write_run_file(tmp_path, run_id, "failure-calls.json", evidence)
+
+    with pytest.raises(AssertionError, match="subscription"):
+        driver_for(tmp_path, run_id).summarise("platform-failure")
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("operation", "crm.customer.get"),
+        ("phase", "before_call"),
+        ("effect", "error"),
+        ("correlationId", "case-unbound"),
+        ("activatedAt", "2026-08-19T10:00:01Z"),
+    ],
+)
+def test_summary_rejects_unbound_fault_activation_metadata(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+) -> None:
+    run_id = "run-activation-mismatch"
+    write_failure_evidence(tmp_path, run_id, REQUIRED_FAILURE_OPERATIONS)
+    activation_evidence = read_run_body(tmp_path, "fault-activations.json")
+    activations = activation_evidence["activations"]
+    assert isinstance(activations, list)
+    activation = activations[0]
+    assert isinstance(activation, dict)
+    activation[field] = replacement
+    write_run_file(tmp_path, run_id, "fault-activations.json", activation_evidence)
+
+    with pytest.raises(AssertionError, match="fault activation"):
+        driver_for(tmp_path, run_id).summarise("platform-failure")
+
+
+def test_summary_rejects_different_checksum_between_success_and_failure_resets(
+    tmp_path: Path,
+) -> None:
+    run_id = "run-cross-scenario-checksum"
+    write_full_evidence(tmp_path, run_id)
+    success_evidence = read_run_body(tmp_path, "successful-calls.json")
+    calls = success_evidence["calls"]
+    assert isinstance(calls, list)
+    reset = call_for(calls, "control.reset")
+    assertion = reset["assertion"]
+    response = reset["response"]
+    assert isinstance(assertion, dict)
+    assert isinstance(response, dict)
+    for body in (assertion["actual"], assertion["expected"], response["body"]):
+        assert isinstance(body, dict)
+        body["manifestChecksum"] = "other-checksum"
+    write_run_file(tmp_path, run_id, "successful-calls.json", success_evidence)
+    prepare = read_run_body(tmp_path, "prepare-state.json")
+    prepare["manifestChecksum"] = "other-checksum"
+    write_run_file(tmp_path, run_id, "prepare-state.json", prepare)
+
+    with pytest.raises(AssertionError, match="checksum"):
+        driver_for(tmp_path, run_id).summarise("platform-contracts")
+
+
+def test_summary_rescans_read_evidence_for_sensitive_values(tmp_path: Path) -> None:
+    run_id = "run-sensitive-read"
+    write_full_evidence(tmp_path, run_id)
+    network = read_run_body(tmp_path, "network.json")
+    network["accessToken"] = "synthetic-non-secret"
+    write_run_file(tmp_path, run_id, "network.json", network)
+
+    with pytest.raises(AssertionError, match="forbidden key"):
+        driver_for(tmp_path, run_id).summarise("platform-contracts")
+
+
+def test_publish_rejects_minimal_passed_summary(tmp_path: Path) -> None:
+    run_id = "run-minimal-summary"
+    run_root = tmp_path / "runs" / run_id
+    run_root.mkdir(parents=True)
+    write_run_file(run_root, run_id, "summary.json", {"status": "passed"})
+
+    with pytest.raises(AssertionError, match="summary shape"):
+        publish_latest(tmp_path, run_root, run_id)
+
+    assert not (tmp_path / "latest-run.json").exists()
+
+
+@pytest.mark.parametrize("mutation", ["semantic", "sensitive", "extra-file"])
+def test_publish_revalidates_exact_evidence_after_summary(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    run_id = f"run-post-summary-{mutation}"
+    run_root = tmp_path / "runs" / run_id
+    run_root.mkdir(parents=True)
+    write_full_evidence(run_root, run_id)
+    driver_for(run_root, run_id).summarise("platform-contracts")
+    if mutation == "extra-file":
+        write_run_file(run_root, run_id, "unrelated.json", {"value": "safe"})
+    else:
+        network = read_run_body(run_root, "network.json")
+        if mutation == "semantic":
+            compose_networks = network["composeNetworks"]
+            assert isinstance(compose_networks, dict)
+            conformance_networks = compose_networks["conformance"]
+            assert isinstance(conformance_networks, list)
+            conformance_networks.append("twin-webhook-egress")
+        else:
+            network["accessToken"] = "synthetic-non-secret"
+        write_run_file(run_root, run_id, "network.json", network)
+
+    with pytest.raises(AssertionError):
+        publish_latest(tmp_path, run_root, run_id)
+
+    assert not (tmp_path / "latest-run.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("containerId", "different-container"),
+        ("startedAt", "not-a-timestamp"),
+        ("startedAt", "2026-08-19T09:59:00Z"),
+    ],
+)
+def test_summary_rejects_invalid_restart_metadata(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+) -> None:
+    run_id = "run-invalid-restart"
+    write_full_evidence(tmp_path, run_id)
+    restart = read_run_body(tmp_path, "restart.json")
+    after = restart["after"]
+    assert isinstance(after, dict)
+    after[field] = replacement
+    write_run_file(tmp_path, run_id, "restart.json", restart)
+
+    with pytest.raises(AssertionError, match="restart"):
+        driver_for(tmp_path, run_id).summarise("platform-contracts")
 
 
 def test_summary_rejects_run_bound_files_with_unproved_assertions(tmp_path: Path) -> None:
@@ -1172,6 +1607,7 @@ def test_summary_rejects_unrelated_accepted_event(tmp_path: Path) -> None:
     assert isinstance(accepted_events, list)
     accepted_events.append(
         {
+            "sequence": 6,
             "eventId": "evt-unrelated",
             "source": "crm",
             "eventType": "crm.note.created",

@@ -12,6 +12,7 @@ import subprocess
 from collections import Counter
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -109,6 +110,56 @@ JWT_SHAPED_VALUE = re.compile(
     r"([A-Za-z0-9_-]{8,})(?![A-Za-z0-9_-])"
 )
 INFER_RESPONSE_STATUS = object()
+
+REQUIRED_EVIDENCE_BY_MODE = {
+    "platform-success": {
+        "successful-calls.json",
+        "webhook-transcript.json",
+        "prepare-state.json",
+    },
+    "platform-failure": {
+        "failure-calls.json",
+        "fault-activations.json",
+        "reset-checksums.json",
+    },
+    "platform-contracts": {
+        "successful-calls.json",
+        "failure-calls.json",
+        "webhook-transcript.json",
+        "reset-checksums.json",
+        "fault-activations.json",
+        "restart-calls.json",
+        "restart.json",
+        "network.json",
+        "prepare-state.json",
+    },
+}
+SUMMARY_BY_MODE: dict[str, JsonObject] = {
+    "platform-success": {"status": "passed", "mode": "platform-success"},
+    "platform-failure": {"status": "passed", "mode": "platform-failure"},
+    "platform-contracts": {
+        "status": "passed",
+        "successfulSequence": "passed",
+        "failureSequence": "passed",
+        "restartPersistence": "passed",
+        "webhookSignatures": "passed",
+        "resetContract": "passed",
+        "networkIsolation": "passed",
+    },
+}
+EXPECTED_PROFILE_NETWORKS = {
+    "webhook-receiver": ["conformance-admin", "twin-webhook-egress"],
+    "conformance": ["conformance-admin", "twin-control", "twin-public"],
+    "public-probe": ["twin-public"],
+}
+EXPECTED_NETWORK_ASSERTIONS = {
+    "controlNotPublished": True,
+    "conformanceHasNoDatabaseUrl": True,
+    "dockerSocketAbsent": True,
+    "driverOffWebhookEgress": True,
+    "receiverOffControl": True,
+    "publicProbeCannotResolveControl": True,
+}
 
 
 @dataclass(frozen=True)
@@ -348,6 +399,7 @@ FAILURE_OPERATION_CONTRACTS = {
         request_fields={"actorClass": "read-only", "expectedVersion": 1},
         expected={"status": 403, "error": {"code": "forbidden"}},
         actual={"status": 403, "error": {"code": "forbidden"}},
+        required_request_keys=("bodyHash",),
     ),
     "crm.notes.after-read-only-denial": operation_contract(
         1,
@@ -655,6 +707,7 @@ RESTART_OPERATION_SEQUENCE = (
 )
 
 ACCEPTED_EVENT_JOIN_FIELDS = (
+    "sequence",
     "eventId",
     "bodyHash",
     "source",
@@ -883,10 +936,12 @@ def validate_operation_contracts(
 
 
 def accepted_event_join_key(value: JsonObject, name: str) -> tuple[object, ...]:
-    string_fields = ACCEPTED_EVENT_JOIN_FIELDS[:-1]
+    string_fields = ACCEPTED_EVENT_JOIN_FIELDS[1:-1]
+    if type(value.get("sequence")) is not int or value["sequence"] < 1:
+        raise AssertionError(f"{name} has an invalid receiver sequence")
     if any(not isinstance(value.get(field), str) or not value[field] for field in string_fields):
         raise AssertionError(f"{name} has incomplete join fields")
-    if not isinstance(value.get("responseStatus"), int):
+    if type(value.get("responseStatus")) is not int:
         raise AssertionError(f"{name} has an invalid response status")
     return tuple(value[field] for field in ACCEPTED_EVENT_JOIN_FIELDS)
 
@@ -895,6 +950,16 @@ def validate_accepted_event_join(
     attempts: list[JsonObject],
     accepted_events: list[JsonObject],
 ) -> None:
+    attempt_sequences = [attempt.get("sequence") for attempt in attempts]
+    if any(
+        type(sequence) is not int for sequence in attempt_sequences
+    ) or attempt_sequences != list(range(1, len(attempts) + 1)):
+        raise AssertionError("webhook attempt receiver sequence is not unique and contiguous")
+    event_sequences = [event.get("sequence") for event in accepted_events]
+    if any(type(sequence) is not int for sequence in event_sequences) or len(
+        event_sequences
+    ) != len(set(event_sequences)):
+        raise AssertionError("accepted webhook event receiver sequence is not unique")
     accepted_attempts = [attempt for attempt in attempts if attempt.get("outcome") == "accepted"]
     event_keys: list[tuple[object, ...]] = []
     for event in accepted_events:
@@ -914,6 +979,53 @@ def validate_accepted_event_join(
             raise AssertionError(
                 "accepted attempt does not match exactly one accepted webhook event"
             )
+
+
+def operation_request_fields(calls: list[JsonObject], operation: str) -> list[JsonObject]:
+    return [
+        evidence_object(
+            evidence_object(call["request"], f"{operation} request")["fields"],
+            f"{operation} request fields",
+        )
+        for call in calls
+        if call["operation"] == operation
+    ]
+
+
+def parse_utc_rfc3339(value: object, name: str) -> datetime:
+    if not isinstance(value, str) or "T" not in value:
+        raise AssertionError(f"{name} is not a UTC RFC3339 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise AssertionError(f"{name} is not a UTC RFC3339 timestamp") from exc
+    if parsed.utcoffset() != timedelta(0):
+        raise AssertionError(f"{name} is not a UTC RFC3339 timestamp")
+    return parsed
+
+
+def validate_network_evidence(network: JsonObject) -> None:
+    assertions = network.get("assertions")
+    assertions_valid = (
+        isinstance(assertions, dict)
+        and set(assertions) == set(EXPECTED_NETWORK_ASSERTIONS)
+        and all(value is True for value in assertions.values())
+    )
+    if (
+        set(network)
+        != {
+            "runId",
+            "composeNetworks",
+            "runtimeNetworks",
+            "hostBindings",
+            "assertions",
+        }
+        or network.get("composeNetworks") != EXPECTED_PROFILE_NETWORKS
+        or network.get("runtimeNetworks") != EXPECTED_PROFILE_NETWORKS
+        or network.get("hostBindings") != {service: {} for service in EXPECTED_PROFILE_NETWORKS}
+        or not assertions_valid
+    ):
+        raise AssertionError("network evidence does not match the isolated profile contract")
 
 
 def operation_actuals(calls: list[JsonObject], operation: str) -> list[JsonObject]:
@@ -1045,6 +1157,7 @@ class Driver:
         value = json.loads((self.artifacts / name).read_text(encoding="utf-8"))
         if not isinstance(value, dict) or value.get("runId") != self.run_id:
             raise AssertionError(f"{name} is not bound to this run")
+        check_no_sensitive_values(value)
         return cast(JsonObject, value)
 
     def record(
@@ -1759,7 +1872,11 @@ class Driver:
             operation="auth.read-only-write",
             method="POST",
             path="/v1/customers/cus_unique/notes",
-            request_fields={"actorClass": "read-only", "expectedVersion": 1},
+            request_fields={
+                "actorClass": "read-only",
+                "expectedVersion": 1,
+                "bodyHash": hashlib.sha256(forbidden_body_text.encode()).hexdigest(),
+            },
             expected={"status": 403, "error": {"code": "forbidden"}},
             actual={
                 "status": forbidden.status_code,
@@ -2098,6 +2215,7 @@ class Driver:
                 "status": activations_response.status_code,
                 "activationCount": len(activations),
                 "ruleIds": [item["ruleId"] for item in activations],
+                "activations": activations,
             },
             response_status=activations_response.status_code,
         )
@@ -2404,32 +2522,13 @@ class Driver:
             },
         )
 
-    def summarise(self, mode: str) -> None:
-        required_by_mode = {
-            "platform-success": {
-                "successful-calls.json",
-                "webhook-transcript.json",
-                "prepare-state.json",
-            },
-            "platform-failure": {
-                "failure-calls.json",
-                "fault-activations.json",
-                "reset-checksums.json",
-            },
-            "platform-contracts": {
-                "successful-calls.json",
-                "failure-calls.json",
-                "webhook-transcript.json",
-                "reset-checksums.json",
-                "fault-activations.json",
-                "restart-calls.json",
-                "restart.json",
-                "network.json",
-                "prepare-state.json",
-            },
-        }
-        required = required_by_mode[mode]
+    def validate_evidence(self, mode: str) -> JsonObject:
+        if mode not in REQUIRED_EVIDENCE_BY_MODE:
+            raise AssertionError("unknown conformance summary mode")
+        required = REQUIRED_EVIDENCE_BY_MODE[mode]
         evidence = {name: self.read(name) for name in required}
+        success_checksum: object = None
+        failure_checksum: object = None
         if mode in {"platform-success", "platform-contracts"}:
             successful = validate_transcript(
                 evidence["successful-calls.json"].get("calls"), "successful-call"
@@ -2447,6 +2546,7 @@ class Driver:
                 if item.get("eventId") == cross_event_id
                 and item.get("source") == "crm"
                 and item.get("eventType") == "crm.note.created"
+                and item.get("correlationId") == "case-cross-subscription-signature"
                 and item.get("outcome") == "signature_rejected"
                 and item.get("responseStatus") == 401
             ]
@@ -2462,7 +2562,8 @@ class Driver:
                 or any(item.get("eventId") == cross_event_id for item in accepted_events)
             ):
                 raise AssertionError(
-                    "webhook evidence does not prove retry and cross-subscription signature checks"
+                    "webhook evidence does not prove cross-subscription signature checks "
+                    "or selected correlations"
                 )
             successful_operations = {cast(str, call["operation"]) for call in successful}
             missing_success = REQUIRED_SUCCESS_OPERATIONS - successful_operations
@@ -2504,6 +2605,7 @@ class Driver:
                 and attempt.get("bodyHash") == retry_fields.get("bodyHash")
                 and attempt.get("source") == "identity"
                 and attempt.get("eventType") == "identity.token.issued"
+                and attempt.get("correlationId") == "case-identity-unarmed-retry"
             ]
             if not any(
                 attempt.get("outcome") == "unarmed" and attempt.get("responseStatus") == 503
@@ -2512,7 +2614,9 @@ class Driver:
                 attempt.get("outcome") == "accepted" and attempt.get("responseStatus") == 204
                 for attempt in matching_retry_attempts
             ):
-                raise AssertionError("Identity retry attempts do not match the transcript")
+                raise AssertionError(
+                    "Identity retry attempts or correlation do not match the transcript"
+                )
             retry_accepted_events = [
                 event
                 for event in accepted_events
@@ -2520,6 +2624,7 @@ class Driver:
                 and event.get("bodyHash") == retry_fields.get("bodyHash")
                 and event.get("source") == "identity"
                 and event.get("eventType") == "identity.token.issued"
+                and event.get("correlationId") == "case-identity-unarmed-retry"
                 and event.get("outcome") == "accepted"
                 and event.get("responseStatus") == 204
             ]
@@ -2550,13 +2655,16 @@ class Driver:
                 and attempt.get("bodyHash") == zero_fields.get("bodyHash")
                 and attempt.get("source") == zero_fields.get("source")
                 and attempt.get("eventType") == zero_fields.get("eventType")
+                and attempt.get("correlationId") == "case-bad-signature"
                 and attempt.get("outcome") == "signature_rejected"
                 and attempt.get("responseStatus") == 401
             ]
             if len(zero_attempts) != 1 or any(
                 event.get("eventId") == zero_fields.get("eventId") for event in accepted_events
             ):
-                raise AssertionError("zero-signature attempt does not match the transcript")
+                raise AssertionError(
+                    "zero-signature attempt or correlation does not match the transcript"
+                )
             prepare = evidence["prepare-state.json"]
             success_reset = evidence_object(
                 operation_actuals(successful, "control.reset")[0],
@@ -2572,6 +2680,7 @@ class Driver:
                 or prepare.get("noteId") != created_note.get("noteId")
             ):
                 raise AssertionError("prepare state does not match the success transcript")
+            success_checksum = success_reset.get("manifestChecksum")
         if mode in {"platform-failure", "platform-contracts"}:
             failures = validate_transcript(
                 evidence["failure-calls.json"].get("calls"), "failure-call"
@@ -2598,11 +2707,66 @@ class Driver:
                 FAILURE_OPERATION_SEQUENCE,
                 "failure transcript",
             )
+            baseline_actual = evidence_object(
+                operation_actuals(failures, "crm.note.create.idempotency-baseline")[0],
+                "baseline note actual",
+            )
+            unchanged_after_forbidden = operation_request_fields(
+                failures, "crm.notes.after-read-only-denial"
+            )[0]
+            unchanged_after_idempotency = operation_request_fields(
+                failures, "crm.notes.after-idempotency-denial"
+            )[0]
+            forbidden_write = operation_request_fields(failures, "auth.read-only-write")[0]
+            changed_write = operation_request_fields(failures, "crm.note.idempotency-mismatch")[0]
+            timed_out_write = operation_request_fields(failures, "crm.note.after-commit-timeout")[0]
+            timeout_read = operation_request_fields(failures, "crm.note.timeout.read")[0]
+            if (
+                unchanged_after_idempotency.get("validNoteId") != baseline_actual.get("noteId")
+                or unchanged_after_forbidden.get("rejectedBodyHash")
+                != forbidden_write.get("bodyHash")
+                or unchanged_after_idempotency.get("forbiddenBodyHash")
+                != forbidden_write.get("bodyHash")
+                or unchanged_after_idempotency.get("changedBodyHash")
+                != changed_write.get("bodyHash")
+                or timeout_read.get("bodyHash") != timed_out_write.get("bodyHash")
+            ):
+                raise AssertionError("failure evidence request observations are not cross-bound")
+            for source in ("identity", "crm"):
+                created_subscription = evidence_object(
+                    operation_actuals(failures, f"{source}.subscription.create")[0],
+                    f"created {source} subscription actual",
+                )
+                listed_subscriptions = evidence_object(
+                    operation_actuals(failures, f"{source}.subscriptions.before-reset")[0],
+                    f"listed {source} subscriptions actual",
+                )
+                if listed_subscriptions.get("subscriptionIds") != [
+                    created_subscription.get("subscriptionId")
+                ]:
+                    raise AssertionError(
+                        f"{source} subscription evidence does not match the created subscription"
+                    )
             activations = evidence_list(
                 evidence["fault-activations.json"].get("activations"), "fault activation"
             )
-            if len(activations) != 1 or activations[0].get("ruleId") != "crm-note-timeout-once":
-                raise AssertionError("failure evidence does not prove one timeout activation")
+            expected_activation = {
+                "ruleId": "crm-note-timeout-once",
+                "operation": "crm.note.create",
+                "phase": "after_commit",
+                "effect": "timeout",
+                "correlationId": "case-platform-failures",
+                "activatedAt": INITIAL_TIME,
+            }
+            if (
+                len(activations) != 1
+                or not isinstance(activations[0].get("activationId"), str)
+                or not activations[0]["activationId"]
+                or any(
+                    activations[0].get(key) != value for key, value in expected_activation.items()
+                )
+            ):
+                raise AssertionError("fault activation evidence does not prove one timeout")
             activation_actual = evidence_object(
                 operation_actuals(
                     failures,
@@ -2610,9 +2774,11 @@ class Driver:
                 )[0],
                 "fault activation transcript actual",
             )
-            if activation_actual.get("ruleIds") != [
-                activation.get("ruleId") for activation in activations
-            ]:
+            if (
+                activation_actual.get("ruleIds")
+                != [activation.get("ruleId") for activation in activations]
+                or activation_actual.get("activations") != activations
+            ):
                 raise AssertionError("fault activation file does not match the transcript")
             reset = evidence["reset-checksums.json"]
             before = evidence_object(reset.get("before"), "reset before")
@@ -2662,6 +2828,7 @@ class Driver:
                 after,
                 virtual_time,
             )
+            failure_checksum = before.get("manifestChecksum")
         if mode == "platform-contracts":
             restart_calls = validate_transcript(
                 evidence["restart-calls.json"].get("calls"), "restart-call"
@@ -2679,13 +2846,20 @@ class Driver:
             before_restart = evidence_object(restart.get("before"), "restart before")
             after_restart = evidence_object(restart.get("after"), "restart after")
             public_state = evidence_object(restart.get("publicState"), "restart public state")
-            network_assertions = evidence_object(
-                evidence["network.json"].get("assertions"), "network assertion"
+            validate_network_evidence(evidence["network.json"])
+            before_container_id = before_restart.get("containerId")
+            after_container_id = after_restart.get("containerId")
+            before_started_at = parse_utc_rfc3339(
+                before_restart.get("startedAt"), "restart before StartedAt"
+            )
+            after_started_at = parse_utc_rfc3339(
+                after_restart.get("startedAt"), "restart after StartedAt"
             )
             if (
-                not before_restart.get("containerId")
-                or not after_restart.get("containerId")
-                or before_restart.get("startedAt") == after_restart.get("startedAt")
+                not isinstance(before_container_id, str)
+                or not before_container_id
+                or after_container_id != before_container_id
+                or after_started_at <= before_started_at
                 or public_state.get("survived") is not True
             ):
                 raise AssertionError("restart evidence does not prove restart persistence")
@@ -2701,23 +2875,12 @@ class Driver:
                 "expectedNoteId"
             ) or public_state.get("noteId") != prepare.get("noteId"):
                 raise AssertionError("restart state does not match the transcript")
-            if not network_assertions or not all(
-                value is True for value in network_assertions.values()
-            ):
-                raise AssertionError("network evidence does not prove the isolation assertions")
-        if mode == "platform-contracts":
-            summary = {
-                "status": "passed",
-                "successfulSequence": "passed",
-                "failureSequence": "passed",
-                "restartPersistence": "passed",
-                "webhookSignatures": "passed",
-                "resetContract": "passed",
-                "networkIsolation": "passed",
-            }
-        else:
-            summary = {"status": "passed", "mode": mode}
-        self.write("summary.json", summary)
+        if mode == "platform-contracts" and success_checksum != failure_checksum:
+            raise AssertionError("success and failure scenario checksums disagree")
+        return SUMMARY_BY_MODE[mode]
+
+    def summarise(self, mode: str) -> None:
+        self.write("summary.json", self.validate_evidence(mode))
 
 
 def inspect_json(docker: str, container: str) -> JsonObject:
@@ -2800,9 +2963,32 @@ def record_network_proof(artifact_root: Path, run_id: str) -> None:
 
 
 def publish_latest(root: Path, artifact_root: Path, run_id: str) -> None:
-    summary = json.loads((artifact_root / "summary.json").read_text(encoding="utf-8"))
-    if summary.get("runId") != run_id or summary.get("status") != "passed":
-        raise AssertionError("only a passed run-bound summary can be published")
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = artifact_root
+    try:
+        summary = driver.read("summary.json")
+    except AssertionError as exc:
+        raise AssertionError("only a passed run-bound summary can be published") from exc
+    matching_modes = [
+        mode
+        for mode, expected in SUMMARY_BY_MODE.items()
+        if summary == {"runId": run_id} | expected
+    ]
+    if len(matching_modes) != 1:
+        raise AssertionError("passed conformance summary shape is not exact")
+    mode = matching_modes[0]
+    expected_files = REQUIRED_EVIDENCE_BY_MODE[mode] | {"summary.json"}
+    actual_files = {path.name for path in artifact_root.iterdir()}
+    if actual_files != expected_files or not all(
+        (artifact_root / name).is_file() for name in expected_files
+    ):
+        raise AssertionError("conformance run file set does not match its summary mode")
+    validated_summary = driver.validate_evidence(mode)
+    if summary != {"runId": run_id} | validated_summary:
+        raise AssertionError("published summary does not match validated evidence")
+    for name in expected_files:
+        driver.read(name)
     relative = artifact_root.relative_to(root)
     pointer = {"runId": run_id, "artifactRoot": str(relative)}
     temporary = root / f".latest-run-{run_id}.tmp"
