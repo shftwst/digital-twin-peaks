@@ -68,6 +68,12 @@ def write_run_file(root: Path, run_id: str, name: str, body: dict[str, object]) 
     )
 
 
+def read_run_body(root: Path, name: str) -> dict[str, object]:
+    payload = json.loads((root / name).read_text(encoding="utf-8"))
+    del payload["runId"]
+    return payload
+
+
 def transcript_call(operation: str) -> dict[str, object]:
     result = {"status": 200}
     return {
@@ -206,6 +212,7 @@ def valid_success_calls(*, cross_body_hash: str = "a" * 64) -> list[dict[str, ob
             "POST",
             "/events",
             request_fields={
+                "eventId": "evt_deliberate_bad_signature",
                 "source": "crm",
                 "eventType": "crm.note.created",
                 "bodyHash": "f" * 64,
@@ -669,6 +676,7 @@ def write_success_evidence(
                     "eventId": "evt-identity-retry",
                     "source": "identity",
                     "eventType": "identity.token.issued",
+                    "correlationId": "case-identity-unarmed-retry",
                     "bodyHash": "e" * 64,
                     "outcome": "unarmed",
                     "responseStatus": 503,
@@ -677,6 +685,7 @@ def write_success_evidence(
                     "eventId": "evt-identity-retry",
                     "source": "identity",
                     "eventType": "identity.token.issued",
+                    "correlationId": "case-identity-unarmed-retry",
                     "bodyHash": retry_accepted_body_hash,
                     "outcome": "accepted",
                     "responseStatus": 204,
@@ -689,14 +698,54 @@ def write_success_evidence(
                     "outcome": "signature_rejected",
                     "responseStatus": 401,
                 },
+                {
+                    "eventId": "evt_deliberate_bad_signature",
+                    "source": "crm",
+                    "eventType": "crm.note.created",
+                    "correlationId": "case-bad-signature",
+                    "bodyHash": "f" * 64,
+                    "outcome": "signature_rejected",
+                    "responseStatus": 401,
+                },
+                {
+                    "eventId": "evt-crm-note",
+                    "source": "crm",
+                    "eventType": "crm.note.created",
+                    "correlationId": "case-platform-success",
+                    "bodyHash": "9" * 64,
+                    "outcome": "accepted",
+                    "responseStatus": 204,
+                },
             ],
-            "acceptedEvents": [],
+            "acceptedEvents": [
+                {
+                    "eventId": "evt-identity-retry",
+                    "source": "identity",
+                    "eventType": "identity.token.issued",
+                    "correlationId": "case-identity-unarmed-retry",
+                    "bodyHash": "e" * 64,
+                    "outcome": "accepted",
+                    "responseStatus": 204,
+                    "signatureValid": True,
+                },
+                {
+                    "eventId": "evt-crm-note",
+                    "source": "crm",
+                    "eventType": "crm.note.created",
+                    "correlationId": "case-platform-success",
+                    "bodyHash": "9" * 64,
+                    "outcome": "accepted",
+                    "responseStatus": 204,
+                    "signatureValid": True,
+                },
+            ],
             "identityRetry": {
                 "virtualAdvance": "PT2S",
                 "sameEventId": True,
                 "sameBodyHash": True,
             },
             "crossSubscriptionRejected": True,
+            "zeroSignatureRejected": True,
             "wrongSignatureRejected": True,
         },
     )
@@ -876,43 +925,15 @@ def test_summary_rejects_success_without_cross_subscription_rejection(
     tmp_path: Path,
 ) -> None:
     run_id = "run-global-secret-could-pass"
-    calls = []
-    for sequence, operation in enumerate(sorted(REQUIRED_SUCCESS_OPERATIONS), start=1):
-        call = transcript_call(operation)
-        call["sequence"] = sequence
-        calls.append(call)
-    write_run_file(
-        tmp_path,
-        run_id,
-        "successful-calls.json",
-        {"calls": calls},
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    attempts = webhook["attempts"]
+    assert isinstance(attempts, list)
+    cross_attempt = next(
+        attempt for attempt in attempts if attempt["eventId"] == "evt_cross_subscription_signature"
     )
-    write_run_file(
-        tmp_path,
-        run_id,
-        "webhook-transcript.json",
-        {
-            "attempts": [
-                {"outcome": "unarmed"},
-                {"outcome": "accepted"},
-                {
-                    "eventId": "evt_some_other_rejection",
-                    "source": "crm",
-                    "eventType": "crm.note.created",
-                    "outcome": "signature_rejected",
-                },
-            ],
-            "acceptedEvents": [],
-            "identityRetry": {
-                "virtualAdvance": "PT2S",
-                "sameEventId": True,
-                "sameBodyHash": True,
-            },
-            "crossSubscriptionRejected": True,
-            "wrongSignatureRejected": True,
-        },
-    )
-    write_run_file(tmp_path, run_id, "prepare-state.json", {})
+    cross_attempt["eventId"] = "evt_some_other_rejection"
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
     driver = Driver.__new__(Driver)
     driver.run_id = run_id
     driver.artifacts = tmp_path
@@ -1064,7 +1085,142 @@ def test_summary_binds_identity_retry_attempt_to_transcript_body(tmp_path: Path)
     driver.run_id = run_id
     driver.artifacts = tmp_path
 
-    with pytest.raises(AssertionError, match=r"Identity retry.*transcript"):
+    with pytest.raises(
+        AssertionError,
+        match=r"Identity retry.*transcript|accepted webhook event.*attempt",
+    ):
+        driver.summarise("platform-success")
+
+
+def test_summary_rejects_accepted_event_with_different_body_hash(tmp_path: Path) -> None:
+    run_id = "run-accepted-event-wrong-body"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    accepted_events = webhook["acceptedEvents"]
+    assert isinstance(accepted_events, list)
+    identity_event = next(
+        event for event in accepted_events if event["eventId"] == "evt-identity-retry"
+    )
+    identity_event["bodyHash"] = "0" * 64
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"accepted (webhook event|attempt).*"):
+        driver.summarise("platform-success")
+
+
+def test_summary_rejects_accepted_event_with_invalid_signature(tmp_path: Path) -> None:
+    run_id = "run-accepted-event-invalid-signature"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    accepted_events = webhook["acceptedEvents"]
+    assert isinstance(accepted_events, list)
+    identity_event = next(
+        event for event in accepted_events if event["eventId"] == "evt-identity-retry"
+    )
+    identity_event["signatureValid"] = False
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"accepted webhook event.*signature"):
+        driver.summarise("platform-success")
+
+
+def test_summary_requires_accepted_crm_note_event(tmp_path: Path) -> None:
+    run_id = "run-missing-crm-accepted-event"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    accepted_events = webhook["acceptedEvents"]
+    assert isinstance(accepted_events, list)
+    webhook["acceptedEvents"] = [
+        event for event in accepted_events if event.get("correlationId") != "case-platform-success"
+    ]
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"accepted attempt.*event|CRM.*accepted event"):
+        driver.summarise("platform-success")
+
+
+def test_summary_rejects_duplicate_accepted_event(tmp_path: Path) -> None:
+    run_id = "run-duplicate-accepted-event"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    accepted_events = webhook["acceptedEvents"]
+    assert isinstance(accepted_events, list)
+    accepted_events.append(deepcopy(accepted_events[0]))
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"accepted (webhook event|attempt).*"):
+        driver.summarise("platform-success")
+
+
+def test_summary_rejects_unrelated_accepted_event(tmp_path: Path) -> None:
+    run_id = "run-unrelated-accepted-event"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    accepted_events = webhook["acceptedEvents"]
+    assert isinstance(accepted_events, list)
+    accepted_events.append(
+        {
+            "eventId": "evt-unrelated",
+            "source": "crm",
+            "eventType": "crm.note.created",
+            "correlationId": "case-unrelated",
+            "bodyHash": "8" * 64,
+            "outcome": "accepted",
+            "responseStatus": 204,
+            "signatureValid": True,
+        }
+    )
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"accepted webhook event.*attempt"):
+        driver.summarise("platform-success")
+
+
+def test_summary_requires_zero_signature_rejection_flag(tmp_path: Path) -> None:
+    run_id = "run-zero-signature-flag-false"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    webhook["zeroSignatureRejected"] = False
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"signature checks"):
+        driver.summarise("platform-success")
+
+
+def test_summary_binds_zero_signature_attempt_to_transcript(tmp_path: Path) -> None:
+    run_id = "run-unbound-zero-signature-attempt"
+    write_success_evidence(tmp_path, run_id)
+    webhook = read_run_body(tmp_path, "webhook-transcript.json")
+    attempts = webhook["attempts"]
+    assert isinstance(attempts, list)
+    bad_signature_attempt = next(
+        attempt for attempt in attempts if attempt["eventId"] == "evt_deliberate_bad_signature"
+    )
+    bad_signature_attempt["bodyHash"] = "7" * 64
+    write_run_file(tmp_path, run_id, "webhook-transcript.json", webhook)
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"zero-signature.*transcript"):
         driver.summarise("platform-success")
 
 
@@ -1119,6 +1275,26 @@ def test_summary_binds_restart_public_state_to_transcript(tmp_path: Path) -> Non
 
     with pytest.raises(AssertionError, match=r"restart state.*transcript"):
         driver.summarise("platform-contracts")
+
+
+def test_summary_binds_pre_reset_virtual_time_to_advance_transcript(tmp_path: Path) -> None:
+    run_id = "run-unbound-pre-reset-time"
+    reset = valid_reset_evidence()
+    virtual_time = reset["virtualTime"]
+    assert isinstance(virtual_time, dict)
+    virtual_time["beforeReset"] = "2026-08-19T10:06:00Z"
+    write_failure_evidence(
+        tmp_path,
+        run_id,
+        REQUIRED_FAILURE_OPERATIONS,
+        reset=reset,
+    )
+    driver = Driver.__new__(Driver)
+    driver.run_id = run_id
+    driver.artifacts = tmp_path
+
+    with pytest.raises(AssertionError, match=r"time advance.*reset evidence"):
+        driver.summarise("platform-failure")
 
 
 def test_summary_binds_operation_contract_to_response_status(tmp_path: Path) -> None:

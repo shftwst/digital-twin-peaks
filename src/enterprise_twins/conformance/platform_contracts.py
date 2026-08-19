@@ -247,7 +247,11 @@ SUCCESS_OPERATION_CONTRACTS = {
         1,
         "POST",
         "/events",
-        request_fields={"source": "crm", "eventType": "crm.note.created"},
+        request_fields={
+            "eventId": "evt_deliberate_bad_signature",
+            "source": "crm",
+            "eventType": "crm.note.created",
+        },
         expected={"status": 401, "accepted": False},
         actual={"status": 401, "accepted": False},
         required_request_keys=("bodyHash",),
@@ -650,6 +654,16 @@ RESTART_OPERATION_SEQUENCE = (
     "crm.notes.after-restart",
 )
 
+ACCEPTED_EVENT_JOIN_FIELDS = (
+    "eventId",
+    "bodyHash",
+    "source",
+    "eventType",
+    "correlationId",
+    "outcome",
+    "responseStatus",
+)
+
 
 def object_body(response: httpx.Response) -> JsonObject:
     value = response.json()
@@ -868,6 +882,40 @@ def validate_operation_contracts(
             raise AssertionError(f"{operation} operation contract differs from evidence")
 
 
+def accepted_event_join_key(value: JsonObject, name: str) -> tuple[object, ...]:
+    string_fields = ACCEPTED_EVENT_JOIN_FIELDS[:-1]
+    if any(not isinstance(value.get(field), str) or not value[field] for field in string_fields):
+        raise AssertionError(f"{name} has incomplete join fields")
+    if not isinstance(value.get("responseStatus"), int):
+        raise AssertionError(f"{name} has an invalid response status")
+    return tuple(value[field] for field in ACCEPTED_EVENT_JOIN_FIELDS)
+
+
+def validate_accepted_event_join(
+    attempts: list[JsonObject],
+    accepted_events: list[JsonObject],
+) -> None:
+    accepted_attempts = [attempt for attempt in attempts if attempt.get("outcome") == "accepted"]
+    event_keys: list[tuple[object, ...]] = []
+    for event in accepted_events:
+        if event.get("signatureValid") is not True:
+            raise AssertionError("accepted webhook event has an invalid signature")
+        event_keys.append(accepted_event_join_key(event, "accepted webhook event"))
+    attempt_keys = [
+        accepted_event_join_key(attempt, "accepted attempt") for attempt in accepted_attempts
+    ]
+    for event_key in event_keys:
+        if attempt_keys.count(event_key) != 1:
+            raise AssertionError(
+                "accepted webhook event does not match exactly one accepted attempt"
+            )
+    for attempt_key in attempt_keys:
+        if event_keys.count(attempt_key) != 1:
+            raise AssertionError(
+                "accepted attempt does not match exactly one accepted webhook event"
+            )
+
+
 def operation_actuals(calls: list[JsonObject], operation: str) -> list[JsonObject]:
     return [
         evidence_object(call["assertion"], f"{operation} assertion")["actual"]
@@ -894,7 +942,16 @@ def validate_reset_transcript_binding(
         evidence_object(value, "post-reset Control status actual")
         for value in operation_actuals(calls, "control.status.after-reset")
     ]
-    if len(resets) != 2 or len(initial_statuses) != 1 or len(after_statuses) != 1:
+    time_advances = [
+        evidence_object(value, "pre-reset time advance actual")
+        for value in operation_actuals(calls, "control.time.advance.pre-reset")
+    ]
+    if (
+        len(resets) != 2
+        or len(initial_statuses) != 1
+        or len(after_statuses) != 1
+        or len(time_advances) != 1
+    ):
         raise AssertionError("reset transcript does not contain the required Control records")
     first_reset, second_reset = resets
     initial_status = initial_statuses[0]
@@ -912,6 +969,8 @@ def validate_reset_transcript_binding(
         or first_reset.get("randomSeed") != second_reset.get("randomSeed")
     ):
         raise AssertionError("reset transcript and reset evidence disagree")
+    if time_advances[0].get("now") != virtual_time.get("beforeReset"):
+        raise AssertionError("pre-reset time advance does not match reset evidence")
 
 
 def run_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
@@ -1247,6 +1306,7 @@ class Driver:
             method="POST",
             path="/events",
             request_fields={
+                "eventId": "evt_deliberate_bad_signature",
                 "source": "crm",
                 "eventType": "crm.note.created",
                 "bodyHash": hashlib.sha256(body).hexdigest(),
@@ -2377,6 +2437,7 @@ class Driver:
             webhook = evidence["webhook-transcript.json"]
             attempts = evidence_list(webhook.get("attempts"), "webhook attempt")
             accepted_events = evidence_list(webhook.get("acceptedEvents"), "accepted webhook event")
+            validate_accepted_event_join(attempts, accepted_events)
             outcomes = {item.get("outcome") for item in attempts}
             retry = evidence_object(webhook.get("identityRetry"), "identity retry")
             cross_event_id = "evt_cross_subscription_signature"
@@ -2395,6 +2456,7 @@ class Driver:
                 or retry.get("sameEventId") is not True
                 or retry.get("sameBodyHash") is not True
                 or webhook.get("crossSubscriptionRejected") is not True
+                or webhook.get("zeroSignatureRejected") is not True
                 or webhook.get("wrongSignatureRejected") is not True
                 or len(cross_attempts) != 1
                 or any(item.get("eventId") == cross_event_id for item in accepted_events)
@@ -2451,6 +2513,50 @@ class Driver:
                 for attempt in matching_retry_attempts
             ):
                 raise AssertionError("Identity retry attempts do not match the transcript")
+            retry_accepted_events = [
+                event
+                for event in accepted_events
+                if event.get("eventId") == retry_fields.get("eventId")
+                and event.get("bodyHash") == retry_fields.get("bodyHash")
+                and event.get("source") == "identity"
+                and event.get("eventType") == "identity.token.issued"
+                and event.get("outcome") == "accepted"
+                and event.get("responseStatus") == 204
+            ]
+            if len(retry_accepted_events) != 1:
+                raise AssertionError(
+                    "Identity retry accepted event does not match the attempt transcript"
+                )
+            crm_accepted_events = [
+                event
+                for event in accepted_events
+                if event.get("source") == "crm"
+                and event.get("eventType") == "crm.note.created"
+                and event.get("correlationId") == "case-platform-success"
+                and event.get("outcome") == "accepted"
+                and event.get("responseStatus") == 204
+            ]
+            if len(crm_accepted_events) != 1:
+                raise AssertionError("CRM workflow accepted event is missing or duplicated")
+            zero_call = next(
+                call for call in successful if call["operation"] == "receiver.signature.zero-reject"
+            )
+            zero_request = evidence_object(zero_call["request"], "zero-signature request")
+            zero_fields = evidence_object(zero_request["fields"], "zero-signature request fields")
+            zero_attempts = [
+                attempt
+                for attempt in attempts
+                if attempt.get("eventId") == zero_fields.get("eventId")
+                and attempt.get("bodyHash") == zero_fields.get("bodyHash")
+                and attempt.get("source") == zero_fields.get("source")
+                and attempt.get("eventType") == zero_fields.get("eventType")
+                and attempt.get("outcome") == "signature_rejected"
+                and attempt.get("responseStatus") == 401
+            ]
+            if len(zero_attempts) != 1 or any(
+                event.get("eventId") == zero_fields.get("eventId") for event in accepted_events
+            ):
+                raise AssertionError("zero-signature attempt does not match the transcript")
             prepare = evidence["prepare-state.json"]
             success_reset = evidence_object(
                 operation_actuals(successful, "control.reset")[0],
