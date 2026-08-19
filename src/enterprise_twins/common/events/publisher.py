@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,6 +46,7 @@ def record_event(
     correlation_id: str,
     causation_id: str,
     occurred_at: datetime,
+    recorded_at: datetime,
     data: dict[str, Any],
 ) -> EventEnvelope:
     envelope = EventEnvelope(
@@ -57,7 +58,7 @@ def record_event(
         correlationId=correlation_id,
         causationId=causation_id,
         occurredAt=occurred_at,
-        recordedAt=datetime.now(UTC),
+        recordedAt=recorded_at,
         data=data,
     )
     session.add(
