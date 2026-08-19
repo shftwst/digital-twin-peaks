@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -34,6 +35,54 @@ FORBIDDEN_ARTEFACT_VALUES = {
     "webhook-secret",
     "controller-local-token",
     "receiver-conformance-local-token",
+}
+REQUIRED_SUCCESS_OPERATIONS = {
+    "control.reset",
+    "identity.token.issue",
+    "identity.subscription.create",
+    "control.time.advance.identity-retry",
+    "relay.identity.retry",
+    "crm.subscription.create",
+    "receiver.signature.cross-subscription-reject",
+    "receiver.signature.zero-reject",
+    "identity.me",
+    "crm.customer.search",
+    "crm.customer.get",
+    "crm.note.create",
+    "crm.note.replay",
+}
+REQUIRED_FAILURE_OPERATIONS = {
+    "control.reset",
+    "control.status.initial",
+    "identity.token.issue",
+    "auth.missing",
+    "auth.read-only-read",
+    "auth.read-only-write",
+    "crm.notes.after-read-only-denial",
+    "crm.search.ambiguous",
+    "crm.note.precondition.stale",
+    "crm.note.create.idempotency-baseline",
+    "crm.note.idempotency-mismatch",
+    "crm.notes.after-idempotency-denial",
+    "webhook.target.denied",
+    "control.fault.create",
+    "crm.customer.before-timeout",
+    "crm.note.after-commit-timeout",
+    "crm.note.timeout.read",
+    "crm.note.timeout.replay",
+    "control.fault-activations.before-reset",
+    "identity.subscription.create",
+    "crm.subscription.create",
+    "identity.subscriptions.before-reset",
+    "crm.subscriptions.before-reset",
+    "control.time.advance.pre-reset",
+    "control.status.after-reset",
+    "identity.old-token.after-reset",
+    "identity.subscriptions.after-reset",
+    "crm.subscriptions.after-reset",
+    "crm.notes.after-reset",
+    "control.fault-activations.after-reset",
+    "crm.note.idempotency-reuse.after-reset",
 }
 
 
@@ -95,6 +144,87 @@ def evidence_list(value: object, name: str) -> list[JsonObject]:
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
         raise AssertionError(f"{name} evidence is not an object list")
     return cast(list[JsonObject], value)
+
+
+def expected_matches(expected: object, actual: object) -> bool:
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(
+            key in actual and expected_matches(value, actual[key])
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(expected) == len(actual)
+            and all(
+                expected_matches(expected_item, actual_item)
+                for expected_item, actual_item in zip(expected, actual, strict=True)
+            )
+        )
+    return type(expected) is type(actual) and expected == actual
+
+
+def validate_transcript_record(
+    record: JsonObject,
+    *,
+    expected_sequence: int,
+    name: str,
+) -> None:
+    if set(record) != {"sequence", "operation", "request", "response", "assertion"}:
+        raise AssertionError(f"{name} transcript record has incomplete fields")
+    if record["sequence"] != expected_sequence:
+        raise AssertionError(f"{name} transcript sequence is not contiguous")
+    if not isinstance(record["operation"], str) or not record["operation"]:
+        raise AssertionError(f"{name} transcript operation is invalid")
+    request = evidence_object(record["request"], f"{name} transcript request")
+    if set(request) != {"method", "path", "fields"}:
+        raise AssertionError(f"{name} transcript request has incomplete fields")
+    if request["method"] not in {"DELETE", "GET", "PATCH", "POST", "PUT"}:
+        raise AssertionError(f"{name} transcript HTTP method is invalid")
+    if not isinstance(request["path"], str) or not request["path"].startswith("/"):
+        raise AssertionError(f"{name} transcript path is invalid")
+    if not isinstance(request["fields"], dict):
+        raise AssertionError(f"{name} transcript request fields are invalid")
+    response = evidence_object(record["response"], f"{name} transcript response")
+    if set(response) != {"status", "body", "error"}:
+        raise AssertionError(f"{name} transcript response has incomplete fields")
+    assertion = evidence_object(record["assertion"], f"{name} transcript assertion")
+    if set(assertion) != {"expected", "actual", "outcome"}:
+        raise AssertionError(f"{name} transcript assertion has incomplete fields")
+    if assertion["outcome"] != "passed":
+        raise AssertionError(f"{name} transcript assertion did not pass")
+    if not expected_matches(assertion["expected"], assertion["actual"]):
+        raise AssertionError(f"{name} transcript expected result differs from actual")
+    if response["error"] is None:
+        if not isinstance(response["status"], int) or response["body"] != assertion["actual"]:
+            raise AssertionError(f"{name} transcript HTTP response is inconsistent")
+        if (
+            isinstance(assertion["actual"], dict)
+            and "status" in assertion["actual"]
+            and assertion["actual"]["status"] != response["status"]
+        ):
+            raise AssertionError(f"{name} transcript HTTP status differs from actual")
+    elif (
+        response["status"] is not None
+        or response["body"] is not None
+        or not isinstance(response["error"], str)
+        or not response["error"]
+    ):
+        raise AssertionError(f"{name} transcript transport error is inconsistent")
+    elif (
+        not isinstance(assertion["actual"], dict)
+        or assertion["actual"].get("error") != response["error"]
+    ):
+        raise AssertionError(f"{name} transcript transport error differs from actual")
+
+
+def validate_transcript(value: object, name: str) -> list[JsonObject]:
+    calls = evidence_list(value, f"{name} transcript")
+    if not calls:
+        raise AssertionError(f"{name} transcript is empty")
+    for sequence, record in enumerate(calls, start=1):
+        validate_transcript_record(record, expected_sequence=sequence, name=name)
+    return calls
 
 
 def run_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
@@ -186,27 +316,33 @@ class Driver:
     ) -> None:
         if method not in {"DELETE", "GET", "PATCH", "POST", "PUT"}:
             raise AssertionError(f"unsupported transcript HTTP method: {method}")
-        target.append(
-            {
-                "sequence": len(target) + 1,
-                "operation": operation,
-                "request": {
-                    "method": method,
-                    "path": path,
-                    "fields": request_fields,
-                },
-                "response": {
-                    "status": response_status,
-                    "body": actual if error is None else None,
-                    "error": error,
-                },
-                "assertion": {
-                    "expected": expected,
-                    "actual": actual,
-                    "outcome": "passed",
-                },
-            }
+        if not expected_matches(expected, actual):
+            raise AssertionError(f"{operation} expected result differs from actual")
+        record = {
+            "sequence": len(target) + 1,
+            "operation": operation,
+            "request": {
+                "method": method,
+                "path": path,
+                "fields": request_fields,
+            },
+            "response": {
+                "status": response_status,
+                "body": actual if error is None else None,
+                "error": error,
+            },
+            "assertion": {
+                "expected": expected,
+                "actual": actual,
+                "outcome": "passed",
+            },
+        }
+        validate_transcript_record(
+            record,
+            expected_sequence=len(target) + 1,
+            name=operation,
         )
+        target.append(record)
 
     async def reset(self, target: Transcript) -> JsonObject:
         response = await self.client.post(
@@ -420,7 +556,7 @@ class Driver:
             raise AssertionError("wrong-signature webhook entered the accepted-event list")
         self.record(
             self.success_calls,
-            operation="receiver.signature.reject",
+            operation="receiver.signature.zero-reject",
             method="POST",
             path="/events",
             request_fields={
@@ -430,6 +566,67 @@ class Driver:
             },
             expected={"status": 401, "accepted": False},
             actual={"status": response.status_code, "error": error, "accepted": False},
+            response_status=response.status_code,
+        )
+
+    async def deliberate_cross_subscription_signature(self, identity_secret: str) -> None:
+        event_id = "evt_cross_subscription_signature"
+        timestamp = "2026-08-19T10:00:02Z"
+        body = canonical_json(
+            {
+                "eventId": event_id,
+                "eventType": "crm.note.created",
+                "schemaVersion": "1.0",
+                "source": "crm",
+                "subject": "note/cross-subscription-signature",
+                "resourceVersion": 1,
+                "correlationId": "case-cross-subscription-signature",
+                "causationId": "req_cross_subscription_signature",
+                "occurredAt": timestamp,
+                "recordedAt": timestamp,
+                "data": {"proof": "identity-secret-cannot-sign-crm"},
+            }
+        )
+        signature = hmac.new(
+            identity_secret.encode(),
+            timestamp.encode() + b"." + body,
+            hashlib.sha256,
+        ).hexdigest()
+        response = await self.client.post(
+            f"{self.receiver}/events",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Twin-Event-Id": event_id,
+                "X-Twin-Timestamp": timestamp,
+                "X-Twin-Signature": f"v1={signature}",
+            },
+        )
+        require_status(response, 401)
+        error = safe_error(response)
+        accepted = await self.receiver_list("events")
+        accepted_event = any(item["eventId"] == event_id for item in accepted)
+        self.record(
+            self.success_calls,
+            operation="receiver.signature.cross-subscription-reject",
+            method="POST",
+            path="/events",
+            request_fields={
+                "envelopeSource": "crm",
+                "eventType": "crm.note.created",
+                "signingSecretSource": "identity",
+                "bodyHash": hashlib.sha256(body).hexdigest(),
+            },
+            expected={
+                "status": 401,
+                "error": {"code": "unauthenticated"},
+                "accepted": False,
+            },
+            actual={
+                "status": response.status_code,
+                "error": error,
+                "accepted": accepted_event,
+            },
             response_status=response.status_code,
         )
 
@@ -514,6 +711,7 @@ class Driver:
             self.success_calls,
         )
         await self.arm_receiver("crm", "crm.note.created", crm_secret)
+        await self.deliberate_cross_subscription_signature(identity_secret)
         await self.deliberate_bad_signature()
 
         headers = self.business_headers(support, "case-platform-success")
@@ -645,6 +843,8 @@ class Driver:
                     "sameEventId": retried["eventId"] == original["eventId"],
                     "sameBodyHash": retried["bodyHash"] == original["bodyHash"],
                 },
+                "crossSubscriptionRejected": True,
+                "zeroSignatureRejected": True,
                 "wrongSignatureRejected": True,
             },
         )
@@ -686,6 +886,21 @@ class Driver:
         note_ids = [item["noteId"] for item in cast(list[JsonObject], body["items"])]
         if saved["noteId"] not in note_ids:
             raise AssertionError("CRM note did not survive the application restart")
+        self.record(
+            calls,
+            operation="crm.notes.after-restart",
+            method="GET",
+            path="/v1/customers/cus_unique/notes",
+            request_fields={"expectedNoteId": saved["noteId"]},
+            expected={"status": 200, "savedNotePresent": True},
+            actual={
+                "status": notes.status_code,
+                "noteCount": len(note_ids),
+                "savedNotePresent": saved["noteId"] in note_ids,
+            },
+            response_status=notes.status_code,
+        )
+        self.write("restart-calls.json", {"calls": calls})
         self.write(
             "restart.json",
             {
@@ -697,6 +912,32 @@ class Driver:
 
     async def failure(self) -> None:
         initial_reset = await self.reset(self.failure_calls)
+        initial_status_response = await self.client.get(
+            f"{self.control}/control/v1/status",
+            headers=self.control_headers,
+        )
+        require_status(initial_status_response, 200)
+        initial_status = object_body(initial_status_response)
+        self.record(
+            self.failure_calls,
+            operation="control.status.initial",
+            method="GET",
+            path="/control/v1/status",
+            request_fields={},
+            expected={
+                "status": 200,
+                "now": INITIAL_TIME,
+                "randomSeed": RANDOM_SEED,
+            },
+            actual={
+                "status": initial_status_response.status_code,
+                "now": initial_status["now"],
+                "randomSeed": initial_status["randomSeed"],
+                "scenarioEpoch": initial_status["scenarioEpoch"],
+                "manifestChecksum": initial_status["manifestChecksum"],
+            },
+            response_status=initial_status_response.status_code,
+        )
         old_support = await self.token(
             "support-agent",
             "support-secret",
@@ -722,7 +963,7 @@ class Driver:
             method="GET",
             path="/v1/customers",
             request_fields={},
-            expected={"status": 401, "code": "unauthenticated"},
+            expected={"status": 401, "error": {"code": "unauthenticated"}},
             actual={"status": missing.status_code, "error": safe_error(missing)},
             response_status=missing.status_code,
         )
@@ -739,10 +980,26 @@ class Driver:
             headers=read_headers,
         )
         require_status(allowed, 200)
+        allowed_body = object_body(allowed)
+        self.record(
+            self.failure_calls,
+            operation="auth.read-only-read",
+            method="GET",
+            path="/v1/customers/cus_unique",
+            request_fields={"actorClass": "read-only"},
+            expected={"status": 200, "customerId": "cus_unique"},
+            actual={
+                "status": allowed.status_code,
+                "customerId": allowed_body["customerId"],
+                "version": allowed_body["version"],
+            },
+            response_status=allowed.status_code,
+        )
+        forbidden_body_text = "must not be written"
         forbidden = await self.client.post(
             f"{self.crm}/v1/customers/cus_unique/notes",
             headers=read_headers | {"Idempotency-Key": "forbidden-note", "If-Match": '"1"'},
-            json={"body": "must not be written", "association": "account"},
+            json={"body": forbidden_body_text, "association": "account"},
         )
         require_status(forbidden, 403)
         self.record(
@@ -751,15 +1008,38 @@ class Driver:
             method="POST",
             path="/v1/customers/cus_unique/notes",
             request_fields={"actorClass": "read-only", "expectedVersion": 1},
-            expected={"readStatus": 200, "writeStatus": 403},
+            expected={"status": 403, "error": {"code": "forbidden"}},
             actual={
-                "readStatus": allowed.status_code,
-                "writeStatus": forbidden.status_code,
+                "status": forbidden.status_code,
                 "error": safe_error(forbidden),
             },
             response_status=forbidden.status_code,
         )
         headers = self.business_headers(old_support, "case-platform-failures")
+        after_forbidden = await self.client.get(
+            f"{self.crm}/v1/customers/cus_unique/notes",
+            headers=headers,
+        )
+        require_status(after_forbidden, 200)
+        after_forbidden_items = cast(list[JsonObject], object_body(after_forbidden)["items"])
+        rejected_body_present = any(
+            item["body"] == forbidden_body_text for item in after_forbidden_items
+        )
+        self.record(
+            self.failure_calls,
+            operation="crm.notes.after-read-only-denial",
+            method="GET",
+            path="/v1/customers/cus_unique/notes",
+            request_fields={
+                "rejectedBodyHash": hashlib.sha256(forbidden_body_text.encode()).hexdigest()
+            },
+            expected={"noteCount": 0, "rejectedBodyPresent": False},
+            actual={
+                "noteCount": len(after_forbidden_items),
+                "rejectedBodyPresent": rejected_body_present,
+            },
+            response_status=after_forbidden.status_code,
+        )
         ambiguous = await self.client.get(
             f"{self.crm}/v1/customers",
             params={"email": "shared@example.test"},
@@ -793,6 +1073,16 @@ class Driver:
             json=baseline_payload,
         )
         require_status(stale, 409)
+        self.record(
+            self.failure_calls,
+            operation="crm.note.precondition.stale",
+            method="POST",
+            path="/v1/customers/cus_unique/notes",
+            request_fields={"keyLabel": "reused-after-reset", "expectedVersion": 0},
+            expected={"status": 409},
+            actual={"status": stale.status_code, "error": safe_error(stale)},
+            response_status=stale.status_code,
+        )
         valid_headers = stale_headers | {"If-Match": '"1"'}
         valid = await self.client.post(
             f"{self.crm}/v1/customers/cus_unique/notes",
@@ -801,26 +1091,88 @@ class Driver:
         )
         require_status(valid, 201)
         valid_body = object_body(valid)
+        self.record(
+            self.failure_calls,
+            operation="crm.note.create.idempotency-baseline",
+            method="POST",
+            path="/v1/customers/cus_unique/notes",
+            request_fields={
+                "keyLabel": "reused-after-reset",
+                "expectedVersion": 1,
+                "bodyHash": hashlib.sha256(baseline_payload["body"].encode()).hexdigest(),
+            },
+            expected={"status": 201, "replayed": False},
+            actual={
+                "status": valid.status_code,
+                "noteId": valid_body["noteId"],
+                "replayed": valid.headers.get("Idempotency-Replayed") == "true",
+            },
+            response_status=valid.status_code,
+        )
+        changed_body_text = "changed under the same key"
         changed = await self.client.post(
             f"{self.crm}/v1/customers/cus_unique/notes",
             headers=valid_headers,
-            json={"body": "changed under the same key", "association": "account"},
+            json={"body": changed_body_text, "association": "account"},
         )
         require_status(changed, 409)
         self.record(
             self.failure_calls,
-            operation="crm.note.precondition-and-idempotency",
+            operation="crm.note.idempotency-mismatch",
             method="POST",
             path="/v1/customers/cus_unique/notes",
-            request_fields={"keyLabel": "reused-after-reset", "expectedVersions": [0, 1]},
-            expected={"stale": 409, "valid": 201, "changedReplay": 409},
+            request_fields={
+                "keyLabel": "reused-after-reset",
+                "bodyHash": hashlib.sha256(changed_body_text.encode()).hexdigest(),
+            },
+            expected={"status": 409},
             actual={
-                "stale": stale.status_code,
-                "valid": valid.status_code,
-                "changedReplay": changed.status_code,
-                "noteId": valid_body["noteId"],
+                "status": changed.status_code,
+                "error": safe_error(changed),
             },
             response_status=changed.status_code,
+        )
+        after_changed = await self.client.get(
+            f"{self.crm}/v1/customers/cus_unique/notes",
+            headers=headers,
+        )
+        require_status(after_changed, 200)
+        after_changed_items = cast(list[JsonObject], object_body(after_changed)["items"])
+        valid_note_count = sum(
+            item["noteId"] == valid_body["noteId"] and item["body"] == baseline_payload["body"]
+            for item in after_changed_items
+        )
+        self.record(
+            self.failure_calls,
+            operation="crm.notes.after-idempotency-denial",
+            method="GET",
+            path="/v1/customers/cus_unique/notes",
+            request_fields={
+                "validNoteId": valid_body["noteId"],
+                "forbiddenBodyHash": hashlib.sha256(forbidden_body_text.encode()).hexdigest(),
+                "changedBodyHash": hashlib.sha256(changed_body_text.encode()).hexdigest(),
+            },
+            expected={
+                "noteCount": 1,
+                "validNoteCount": 1,
+                "validNoteIdMatches": True,
+                "forbiddenBodyPresent": False,
+                "changedBodyPresent": False,
+            },
+            actual={
+                "noteCount": len(after_changed_items),
+                "validNoteCount": valid_note_count,
+                "validNoteIdMatches": any(
+                    item["noteId"] == valid_body["noteId"] for item in after_changed_items
+                ),
+                "forbiddenBodyPresent": any(
+                    item["body"] == forbidden_body_text for item in after_changed_items
+                ),
+                "changedBodyPresent": any(
+                    item["body"] == changed_body_text for item in after_changed_items
+                ),
+            },
+            response_status=after_changed.status_code,
         )
         invalid_target = await self.client.post(
             f"{self.crm}/v1/webhook-subscriptions",
@@ -855,11 +1207,45 @@ class Driver:
             },
         )
         require_status(fault, 201)
+        fault_body = object_body(fault)
+        self.record(
+            self.failure_calls,
+            operation="control.fault.create",
+            method="POST",
+            path="/control/v1/faults",
+            request_fields={
+                "ruleId": "crm-note-timeout-once",
+                "targetService": "crm",
+                "phase": "after_commit",
+                "delayMs": 500,
+            },
+            expected={"status": 201, "ruleId": "crm-note-timeout-once"},
+            actual={
+                "status": fault.status_code,
+                "ruleId": fault_body["ruleId"],
+            },
+            response_status=fault.status_code,
+        )
         current = await self.client.get(
             f"{self.crm}/v1/customers/cus_unique",
             headers=headers,
         )
         require_status(current, 200)
+        current_body = object_body(current)
+        self.record(
+            self.failure_calls,
+            operation="crm.customer.before-timeout",
+            method="GET",
+            path="/v1/customers/cus_unique",
+            request_fields={},
+            expected={"status": 200, "customerId": "cus_unique"},
+            actual={
+                "status": current.status_code,
+                "customerId": current_body["customerId"],
+                "version": current_body["version"],
+            },
+            response_status=current.status_code,
+        )
         timeout_headers = headers | {
             "Idempotency-Key": "timeout-note",
             "If-Match": current.headers["ETag"],
@@ -898,6 +1284,23 @@ class Driver:
         timeout_notes = [item for item in note_items if item["body"] == timeout_payload["body"]]
         if len(timeout_notes) != 1:
             raise AssertionError("timeout reconciliation did not find exactly one committed note")
+        self.record(
+            self.failure_calls,
+            operation="crm.note.timeout.read",
+            method="GET",
+            path="/v1/customers/cus_unique/notes",
+            request_fields={
+                "bodyHash": hashlib.sha256(timeout_payload["body"].encode()).hexdigest()
+            },
+            expected={"status": 200, "noteCount": 2, "timeoutNoteCount": 1},
+            actual={
+                "status": notes.status_code,
+                "noteCount": len(note_items),
+                "timeoutNoteCount": len(timeout_notes),
+                "timeoutNoteId": timeout_notes[0]["noteId"],
+            },
+            response_status=notes.status_code,
+        )
         replay = await self.client.post(
             f"{self.crm}/v1/customers/cus_unique/notes",
             headers=timeout_headers,
@@ -912,13 +1315,13 @@ class Driver:
             raise AssertionError("timeout replay did not return the committed note")
         self.record(
             self.failure_calls,
-            operation="crm.note.timeout.reconcile",
+            operation="crm.note.timeout.replay",
             method="POST",
             path="/v1/customers/cus_unique/notes",
             request_fields={"sameIdempotencyKey": True},
-            expected={"committedCount": 1, "replayed": True},
+            expected={"status": 201, "replayed": True, "sameNoteId": True},
             actual={
-                "committedCount": len(timeout_notes),
+                "status": replay.status_code,
                 "sameNoteId": replay_body["noteId"] == timeout_notes[0]["noteId"],
                 "replayed": replay.headers.get("Idempotency-Replayed") == "true",
             },
@@ -932,6 +1335,28 @@ class Driver:
         activations = list_body(activations_response)
         if len(activations) != 1 or activations[0]["ruleId"] != "crm-note-timeout-once":
             raise AssertionError("expected exactly one recorded CRM timeout activation")
+        self.record(
+            self.failure_calls,
+            operation="control.fault-activations.before-reset",
+            method="GET",
+            path="/control/v1/fault-activations",
+            request_fields={},
+            expected={"status": 200, "activationCount": 1},
+            actual={
+                "status": activations_response.status_code,
+                "activationCount": len(activations),
+                "ruleIds": [item["ruleId"] for item in activations],
+            },
+            response_status=activations_response.status_code,
+        )
+        await self.create_subscription(
+            self.identity,
+            manager,
+            "identity",
+            "identity.token.issued",
+            "identity-subscription-cleared-by-final-reset",
+            self.failure_calls,
+        )
         await self.create_subscription(
             self.crm,
             manager,
@@ -940,14 +1365,67 @@ class Driver:
             "subscription-cleared-by-final-reset",
             self.failure_calls,
         )
-        subscriptions_before_response = await self.client.get(
-            f"{self.crm}/v1/webhook-subscriptions",
-            headers=self.business_headers(manager, "case-subscriptions-before-reset"),
+        identity_subscriptions_before_response = await self.client.get(
+            f"{self.identity}/v1/webhook-subscriptions",
+            headers=self.business_headers(manager, "case-identity-subscriptions-before-reset"),
         )
-        require_status(subscriptions_before_response, 200)
-        subscriptions_before = list_body(subscriptions_before_response)
-        if len(subscriptions_before) != 1:
-            raise AssertionError("failure proof did not create one subscription before reset")
+        crm_subscriptions_before_response = await self.client.get(
+            f"{self.crm}/v1/webhook-subscriptions",
+            headers=self.business_headers(manager, "case-crm-subscriptions-before-reset"),
+        )
+        require_status(identity_subscriptions_before_response, 200)
+        require_status(crm_subscriptions_before_response, 200)
+        identity_subscriptions_before = list_body(identity_subscriptions_before_response)
+        crm_subscriptions_before = list_body(crm_subscriptions_before_response)
+        if len(identity_subscriptions_before) != 1 or len(crm_subscriptions_before) != 1:
+            raise AssertionError("failure proof did not observe both subscriptions before reset")
+        self.record(
+            self.failure_calls,
+            operation="identity.subscriptions.before-reset",
+            method="GET",
+            path="/v1/webhook-subscriptions",
+            request_fields={"source": "identity"},
+            expected={"status": 200, "subscriptionCount": 1},
+            actual={
+                "status": identity_subscriptions_before_response.status_code,
+                "subscriptionCount": len(identity_subscriptions_before),
+                "subscriptionIds": [
+                    item["subscriptionId"] for item in identity_subscriptions_before
+                ],
+            },
+            response_status=identity_subscriptions_before_response.status_code,
+        )
+        self.record(
+            self.failure_calls,
+            operation="crm.subscriptions.before-reset",
+            method="GET",
+            path="/v1/webhook-subscriptions",
+            request_fields={"source": "crm"},
+            expected={"status": 200, "subscriptionCount": 1},
+            actual={
+                "status": crm_subscriptions_before_response.status_code,
+                "subscriptionCount": len(crm_subscriptions_before),
+                "subscriptionIds": [item["subscriptionId"] for item in crm_subscriptions_before],
+            },
+            response_status=crm_subscriptions_before_response.status_code,
+        )
+        advance_response = await self.client.post(
+            f"{self.control}/control/v1/time/advance",
+            headers=self.control_headers,
+            json={"duration": "PT5M"},
+        )
+        require_status(advance_response, 200)
+        advanced_time = object_body(advance_response)["now"]
+        self.record(
+            self.failure_calls,
+            operation="control.time.advance.pre-reset",
+            method="POST",
+            path="/control/v1/time/advance",
+            request_fields={"duration": "PT5M"},
+            expected={"status": 200, "now": "2026-08-19T10:05:00Z"},
+            actual={"status": advance_response.status_code, "now": advanced_time},
+            response_status=advance_response.status_code,
+        )
 
         final_reset = await self.reset(self.failure_calls)
         if final_reset["scenarioEpoch"] == initial_reset["scenarioEpoch"]:
@@ -969,11 +1447,43 @@ class Driver:
             or status["now"] != INITIAL_TIME
         ):
             raise AssertionError("stored reset status differs from the reset result")
+        self.record(
+            self.failure_calls,
+            operation="control.status.after-reset",
+            method="GET",
+            path="/control/v1/status",
+            request_fields={},
+            expected={
+                "status": 200,
+                "now": initial_status["now"],
+                "randomSeed": RANDOM_SEED,
+                "scenarioEpoch": final_reset["scenarioEpoch"],
+                "manifestChecksum": final_reset["manifestChecksum"],
+            },
+            actual={
+                "status": status_response.status_code,
+                "now": status["now"],
+                "randomSeed": status["randomSeed"],
+                "scenarioEpoch": status["scenarioEpoch"],
+                "manifestChecksum": status["manifestChecksum"],
+            },
+            response_status=status_response.status_code,
+        )
         old_token = await self.client.get(
             f"{self.identity}/v1/me",
             headers=self.business_headers(old_support, "case-old-token-after-reset"),
         )
         require_status(old_token, 401)
+        self.record(
+            self.failure_calls,
+            operation="identity.old-token.after-reset",
+            method="GET",
+            path="/v1/me",
+            request_fields={"tokenEpoch": "before-reset"},
+            expected={"status": 401, "error": {"code": "unauthenticated"}},
+            actual={"status": old_token.status_code, "error": safe_error(old_token)},
+            response_status=old_token.status_code,
+        )
         new_manager = await self.token(
             "webhook-manager",
             "webhook-secret",
@@ -995,6 +1505,36 @@ class Driver:
         crm_subscriptions_after = list_body(crm_subscriptions)
         if identity_subscriptions_after or crm_subscriptions_after:
             raise AssertionError("reset retained webhook subscriptions")
+        self.record(
+            self.failure_calls,
+            operation="identity.subscriptions.after-reset",
+            method="GET",
+            path="/v1/webhook-subscriptions",
+            request_fields={"source": "identity"},
+            expected={"status": 200, "subscriptionCount": 0},
+            actual={
+                "status": identity_subscriptions.status_code,
+                "subscriptionCount": len(identity_subscriptions_after),
+                "subscriptionIds": [
+                    item["subscriptionId"] for item in identity_subscriptions_after
+                ],
+            },
+            response_status=identity_subscriptions.status_code,
+        )
+        self.record(
+            self.failure_calls,
+            operation="crm.subscriptions.after-reset",
+            method="GET",
+            path="/v1/webhook-subscriptions",
+            request_fields={"source": "crm"},
+            expected={"status": 200, "subscriptionCount": 0},
+            actual={
+                "status": crm_subscriptions.status_code,
+                "subscriptionCount": len(crm_subscriptions_after),
+                "subscriptionIds": [item["subscriptionId"] for item in crm_subscriptions_after],
+            },
+            response_status=crm_subscriptions.status_code,
+        )
         new_support = await self.token(
             "support-agent",
             "support-secret",
@@ -1008,15 +1548,41 @@ class Driver:
             headers=new_headers,
         )
         require_status(empty_notes, 200)
-        if cast(list[JsonObject], object_body(empty_notes)["items"]):
+        empty_note_items = cast(list[JsonObject], object_body(empty_notes)["items"])
+        if empty_note_items:
             raise AssertionError("reset retained CRM notes")
+        self.record(
+            self.failure_calls,
+            operation="crm.notes.after-reset",
+            method="GET",
+            path="/v1/customers/cus_unique/notes",
+            request_fields={},
+            expected={"status": 200, "noteCount": 0},
+            actual={"status": empty_notes.status_code, "noteCount": len(empty_note_items)},
+            response_status=empty_notes.status_code,
+        )
         cleared_faults = await self.client.get(
             f"{self.control}/control/v1/fault-activations",
             headers=self.control_headers,
         )
         require_status(cleared_faults, 200)
-        if list_body(cleared_faults):
+        cleared_fault_items = list_body(cleared_faults)
+        if cleared_fault_items:
             raise AssertionError("reset retained fault activations")
+        self.record(
+            self.failure_calls,
+            operation="control.fault-activations.after-reset",
+            method="GET",
+            path="/control/v1/fault-activations",
+            request_fields={},
+            expected={"status": 200, "activationCount": 0},
+            actual={
+                "status": cleared_faults.status_code,
+                "activationCount": len(cleared_fault_items),
+                "ruleIds": [item["ruleId"] for item in cleared_fault_items],
+            },
+            response_status=cleared_faults.status_code,
+        )
         reused = await self.client.post(
             f"{self.crm}/v1/customers/cus_unique/notes",
             headers=new_headers | {"Idempotency-Key": "reused-after-reset", "If-Match": '"1"'},
@@ -1027,37 +1593,17 @@ class Driver:
             raise AssertionError("pre-reset idempotency key replayed after reset")
         self.record(
             self.failure_calls,
-            operation="control.reset.contract",
+            operation="crm.note.idempotency-reuse.after-reset",
             method="POST",
-            path="/control/v1/reset",
-            request_fields={"randomSeed": RANDOM_SEED},
-            expected={
-                "newEpoch": True,
-                "sameChecksum": True,
-                "oldTokenStatus": 401,
-                "subscriptions": 0,
-                "subscriptionsBeforeReset": 1,
-                "notesBeforeReuse": 0,
-                "faultActivations": 0,
-                "restoredTime": INITIAL_TIME,
-                "idempotencyReplayed": False,
-                "subscriptionCreatedBeforeReset": True,
-            },
+            path="/v1/customers/cus_unique/notes",
+            request_fields={"keyLabel": "reused-after-reset", "expectedVersion": 1},
+            expected={"status": 201, "replayed": False},
             actual={
-                "newEpoch": final_reset["scenarioEpoch"] != initial_reset["scenarioEpoch"],
-                "sameChecksum": (
-                    final_reset["manifestChecksum"] == initial_reset["manifestChecksum"]
-                ),
-                "oldTokenStatus": old_token.status_code,
-                "subscriptions": 0,
-                "subscriptionsBeforeReset": len(subscriptions_before),
-                "notesBeforeReuse": 0,
-                "faultActivations": 0,
-                "restoredTime": status["now"],
-                "idempotencyReplayed": reused.headers.get("Idempotency-Replayed") == "true",
-                "subscriptionCreatedBeforeReset": True,
+                "status": reused.status_code,
+                "noteId": object_body(reused)["noteId"],
+                "replayed": reused.headers.get("Idempotency-Replayed") == "true",
             },
-            response_status=200,
+            response_status=reused.status_code,
         )
         self.write("failure-calls.json", {"calls": self.failure_calls})
         self.write("fault-activations.json", {"activations": activations})
@@ -1077,20 +1623,31 @@ class Driver:
                     "storedManifestChecksum": status["manifestChecksum"],
                 },
                 "assertions": {
-                    "newEpoch": True,
-                    "sameChecksum": True,
-                    "oldTokenRejected": True,
-                    "faultsCleared": True,
-                    "subscriptionsCleared": True,
-                    "notesClearedBeforeReuse": True,
-                    "virtualTimeRestored": True,
-                    "idempotencyKeyDidNotReplay": True,
-                    "subscriptionCreatedBeforeReset": True,
+                    "newEpoch": final_reset["scenarioEpoch"] != initial_reset["scenarioEpoch"],
+                    "sameChecksum": final_reset["manifestChecksum"]
+                    == initial_reset["manifestChecksum"],
+                    "oldTokenRejected": old_token.status_code == 401,
+                    "faultsCleared": not cleared_fault_items,
+                    "subscriptionsCleared": not identity_subscriptions_after
+                    and not crm_subscriptions_after,
+                    "notesClearedBeforeReuse": not empty_note_items,
+                    "virtualTimeRestored": status["now"] == initial_status["now"],
+                    "idempotencyKeyDidNotReplay": reused.headers.get("Idempotency-Replayed")
+                    == "false",
+                    "identitySubscriptionObservedBeforeReset": len(identity_subscriptions_before)
+                    == 1,
+                    "crmSubscriptionObservedBeforeReset": len(crm_subscriptions_before) == 1,
                 },
                 "subscriptionCounts": {
-                    "beforeReset": len(subscriptions_before),
+                    "identityBeforeReset": len(identity_subscriptions_before),
+                    "crmBeforeReset": len(crm_subscriptions_before),
                     "identityAfterReset": len(identity_subscriptions_after),
                     "crmAfterReset": len(crm_subscriptions_after),
+                },
+                "virtualTime": {
+                    "initial": initial_status["now"],
+                    "beforeReset": advanced_time,
+                    "afterReset": status["now"],
                 },
             },
         )
@@ -1109,6 +1666,7 @@ class Driver:
                 "webhook-transcript.json",
                 "reset-checksums.json",
                 "fault-activations.json",
+                "restart-calls.json",
                 "restart.json",
                 "network.json",
             },
@@ -1116,38 +1674,96 @@ class Driver:
         required = required_by_mode[mode]
         evidence = {name: self.read(name) for name in required}
         if mode in {"platform-success", "platform-contracts"}:
-            successful = evidence_list(
+            successful = validate_transcript(
                 evidence["successful-calls.json"].get("calls"), "successful-call"
             )
-            if not successful or not all(
-                isinstance(item.get("assertion"), dict)
-                and item["assertion"].get("outcome") == "passed"
-                for item in successful
-            ):
-                raise AssertionError("successful-call evidence has an unproved assertion")
             webhook = evidence["webhook-transcript.json"]
             attempts = evidence_list(webhook.get("attempts"), "webhook attempt")
+            accepted_events = evidence_list(webhook.get("acceptedEvents"), "accepted webhook event")
             outcomes = {item.get("outcome") for item in attempts}
             retry = evidence_object(webhook.get("identityRetry"), "identity retry")
+            cross_event_id = "evt_cross_subscription_signature"
+            cross_attempts = [
+                item
+                for item in attempts
+                if item.get("eventId") == cross_event_id
+                and item.get("source") == "crm"
+                and item.get("eventType") == "crm.note.created"
+                and item.get("outcome") == "signature_rejected"
+                and item.get("responseStatus") == 401
+            ]
             if (
                 not {"unarmed", "accepted", "signature_rejected"}.issubset(outcomes)
                 or retry.get("virtualAdvance") != "PT2S"
                 or retry.get("sameEventId") is not True
                 or retry.get("sameBodyHash") is not True
+                or webhook.get("crossSubscriptionRejected") is not True
                 or webhook.get("wrongSignatureRejected") is not True
+                or len(cross_attempts) != 1
+                or any(item.get("eventId") == cross_event_id for item in accepted_events)
             ):
-                raise AssertionError("webhook evidence does not prove retry and signature checks")
+                raise AssertionError(
+                    "webhook evidence does not prove retry and cross-subscription signature checks"
+                )
+            successful_operations = {cast(str, call["operation"]) for call in successful}
+            missing_success = REQUIRED_SUCCESS_OPERATIONS - successful_operations
+            if missing_success:
+                raise AssertionError(
+                    f"successful transcript omits required operations: {sorted(missing_success)}"
+                )
+            cross_calls = [
+                call
+                for call in successful
+                if call["operation"] == "receiver.signature.cross-subscription-reject"
+            ]
+            if len(cross_calls) != 1 or not expected_matches(
+                {
+                    "request": {
+                        "fields": {
+                            "envelopeSource": "crm",
+                            "eventType": "crm.note.created",
+                            "signingSecretSource": "identity",
+                        }
+                    },
+                    "response": {"status": 401},
+                    "assertion": {
+                        "actual": {
+                            "status": 401,
+                            "error": {"code": "unauthenticated"},
+                            "accepted": False,
+                        }
+                    },
+                },
+                cross_calls[0] if cross_calls else {},
+            ):
+                raise AssertionError(
+                    "successful transcript does not prove cross-subscription secret binding"
+                )
         if mode in {"platform-failure", "platform-contracts"}:
-            failures = evidence_list(evidence["failure-calls.json"].get("calls"), "failure-call")
-            if not failures or not all(
-                isinstance(item.get("assertion"), dict)
-                and item["assertion"].get("outcome") == "passed"
-                for item in failures
-            ):
-                raise AssertionError("failure-call evidence has an unproved assertion")
+            failures = validate_transcript(
+                evidence["failure-calls.json"].get("calls"), "failure-call"
+            )
+            failure_operations = {cast(str, call["operation"]) for call in failures}
+            unchanged_state_operations = {
+                "crm.notes.after-read-only-denial",
+                "crm.notes.after-idempotency-denial",
+            }
+            missing_unchanged_state = unchanged_state_operations - failure_operations
+            if missing_unchanged_state:
+                raise AssertionError(
+                    "failure transcript omits required unchanged-state reads: "
+                    f"{sorted(missing_unchanged_state)}"
+                )
+            missing_failure = REQUIRED_FAILURE_OPERATIONS - failure_operations
+            if missing_failure:
+                raise AssertionError(
+                    f"failure transcript omits required operations: {sorted(missing_failure)}"
+                )
             activations = evidence_list(
                 evidence["fault-activations.json"].get("activations"), "fault activation"
             )
+            if len(activations) != 1 or activations[0].get("ruleId") != "crm-note-timeout-once":
+                raise AssertionError("failure evidence does not prove one timeout activation")
             reset = evidence["reset-checksums.json"]
             before = evidence_object(reset.get("before"), "reset before")
             after = evidence_object(reset.get("after"), "reset after")
@@ -1155,6 +1771,7 @@ class Driver:
             subscription_counts = evidence_object(
                 reset.get("subscriptionCounts"), "subscription count"
             )
+            virtual_time = evidence_object(reset.get("virtualTime"), "observed reset virtual time")
             expected_reset_assertions = {
                 "newEpoch",
                 "sameChecksum",
@@ -1164,23 +1781,38 @@ class Driver:
                 "notesClearedBeforeReuse",
                 "virtualTimeRestored",
                 "idempotencyKeyDidNotReplay",
-                "subscriptionCreatedBeforeReset",
+                "identitySubscriptionObservedBeforeReset",
+                "crmSubscriptionObservedBeforeReset",
             }
             if (
-                len(activations) != 1
-                or activations[0].get("ruleId") != "crm-note-timeout-once"
-                or before.get("scenarioEpoch") == after.get("scenarioEpoch")
+                before.get("scenarioEpoch") == after.get("scenarioEpoch")
                 or before.get("randomSeed") != RANDOM_SEED
                 or after.get("randomSeed") != RANDOM_SEED
+                or after.get("storedRandomSeed") != RANDOM_SEED
                 or before.get("manifestChecksum") != after.get("manifestChecksum")
+                or after.get("storedManifestChecksum") != before.get("manifestChecksum")
                 or not reset_assertions
                 or subscription_counts
-                != {"beforeReset": 1, "identityAfterReset": 0, "crmAfterReset": 0}
-                or not expected_reset_assertions.issubset(reset_assertions)
+                != {
+                    "identityBeforeReset": 1,
+                    "crmBeforeReset": 1,
+                    "identityAfterReset": 0,
+                    "crmAfterReset": 0,
+                }
+                or virtual_time.get("initial") != INITIAL_TIME
+                or virtual_time.get("beforeReset") == virtual_time.get("initial")
+                or virtual_time.get("afterReset") != virtual_time.get("initial")
+                or set(reset_assertions) != expected_reset_assertions
                 or not all(value is True for value in reset_assertions.values())
             ):
-                raise AssertionError("failure and reset evidence does not prove the contract")
+                raise AssertionError("observed reset evidence does not prove the contract")
         if mode == "platform-contracts":
+            restart_calls = validate_transcript(
+                evidence["restart-calls.json"].get("calls"), "restart-call"
+            )
+            restart_operations = {cast(str, call["operation"]) for call in restart_calls}
+            if not {"identity.token.issue", "crm.notes.after-restart"}.issubset(restart_operations):
+                raise AssertionError("restart transcript omits the public persistence read")
             restart = evidence["restart.json"]
             before_restart = evidence_object(restart.get("before"), "restart before")
             after_restart = evidence_object(restart.get("after"), "restart after")

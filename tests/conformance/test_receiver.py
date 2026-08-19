@@ -22,13 +22,18 @@ def signed_headers(secret: str, event_id: str, body: bytes) -> dict[str, str]:
     }
 
 
-def event_body(event_id: str) -> bytes:
+def event_body(
+    event_id: str,
+    *,
+    source: str = "identity",
+    event_type: str = "identity.token.issued",
+) -> bytes:
     return json.dumps(
         {
             "eventId": event_id,
-            "eventType": "identity.token.issued",
+            "eventType": event_type,
             "schemaVersion": "1.0",
-            "source": "identity",
+            "source": source,
             "subject": "token/tok_test",
             "resourceVersion": 1,
             "correlationId": "case-retry-proof",
@@ -125,4 +130,39 @@ def test_receiver_rejects_bad_credentials_signature_and_event_id_without_accepta
         "/internal/v1/events",
         headers={"Authorization": "Bearer receiver-token"},
     ).json()
+    assert events == []
+
+
+def test_receiver_rejects_valid_signature_from_a_different_source_and_event_type() -> None:
+    client = TestClient(create_receiver_app("receiver-token"))
+    for source, event_type, secret in (
+        ("identity", "identity.token.issued", "identity-secret"),
+        ("crm", "crm.note.created", "crm-secret"),
+    ):
+        configured = client.post(
+            "/internal/v1/secrets",
+            headers={"Authorization": "Bearer receiver-token"},
+            json={"source": source, "eventType": event_type, "secret": secret},
+        )
+        assert configured.status_code == 204
+
+    event_id = "evt_cross_subscription"
+    body = event_body(event_id, source="crm", event_type="crm.note.created")
+    rejected = client.post(
+        "/events",
+        content=body,
+        headers=signed_headers("identity-secret", event_id, body),
+    )
+
+    assert rejected.status_code == 401
+    assert rejected.json()["error"]["code"] == "unauthenticated"
+    attempts = client.get(
+        "/internal/v1/attempts",
+        headers={"Authorization": "Bearer receiver-token"},
+    ).json()
+    events = client.get(
+        "/internal/v1/events",
+        headers={"Authorization": "Bearer receiver-token"},
+    ).json()
+    assert [item["outcome"] for item in attempts] == ["signature_rejected"]
     assert events == []

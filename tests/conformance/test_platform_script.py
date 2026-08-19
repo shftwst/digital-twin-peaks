@@ -52,6 +52,7 @@ def test_platform_contract_script_exports_run_bound_success_and_failure_evidence
         "webhook-transcript.json",
         "reset-checksums.json",
         "fault-activations.json",
+        "restart-calls.json",
         "restart.json",
         "network.json",
     }
@@ -60,3 +61,37 @@ def test_platform_contract_script_exports_run_bound_success_and_failure_evidence
         assert artefact["runId"] == run_id
     faults = json.loads((run_root / "fault-activations.json").read_text(encoding="utf-8"))
     assert len(faults["activations"]) == 1
+    webhook = json.loads((run_root / "webhook-transcript.json").read_text(encoding="utf-8"))
+    assert webhook["crossSubscriptionRejected"] is True
+    reset = json.loads((run_root / "reset-checksums.json").read_text(encoding="utf-8"))
+    assert reset["subscriptionCounts"] == {
+        "identityBeforeReset": 1,
+        "crmBeforeReset": 1,
+        "identityAfterReset": 0,
+        "crmAfterReset": 0,
+    }
+    assert reset["virtualTime"] == {
+        "initial": "2026-08-19T10:00:00Z",
+        "beforeReset": "2026-08-19T10:05:00Z",
+        "afterReset": "2026-08-19T10:00:00Z",
+    }
+    failure = json.loads((run_root / "failure-calls.json").read_text(encoding="utf-8"))
+    calls = failure["calls"]
+    operations = {call["operation"]: call for call in calls}
+    assert operations["crm.notes.after-read-only-denial"]["assertion"]["actual"] == {
+        "noteCount": 0,
+        "rejectedBodyPresent": False,
+    }
+    assert operations["crm.notes.after-idempotency-denial"]["assertion"]["actual"] == {
+        "noteCount": 1,
+        "validNoteCount": 1,
+        "validNoteIdMatches": True,
+        "forbiddenBodyPresent": False,
+        "changedBodyPresent": False,
+    }
+    for sequence, call in enumerate(calls, start=1):
+        assert call["sequence"] == sequence
+        assert call["request"]["method"] in {"GET", "POST", "PUT", "PATCH", "DELETE"}
+        assert call["request"]["path"].startswith("/")
+        assert set(call["response"]) == {"status", "body", "error"}
+        assert call["assertion"]["outcome"] == "passed"
