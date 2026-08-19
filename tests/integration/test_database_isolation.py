@@ -1,14 +1,15 @@
 import os
+from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 import pytest
 
 
 def _identity_url(database: str) -> str:
-    return os.environ.get(
-        "IDENTITY_DATABASE_URL",
-        f"postgresql://identity_user:identity_local_only@postgres/{database}",
-    )
+    identity_url = os.environ.get("IDENTITY_DATABASE_URL")
+    if identity_url is None:
+        pytest.skip("IDENTITY_DATABASE_URL is required for the live database check")
+    return urlunsplit(urlsplit(identity_url)._replace(path=f"/{database}"))
 
 
 @pytest.mark.integration

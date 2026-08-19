@@ -23,6 +23,7 @@ services:
       target: test
     environment:
       TEST_DATABASE_URL: postgresql+asyncpg://platform_test_user:platform_test_local_only@postgres/platform_test
+      IDENTITY_DATABASE_URL: postgresql://identity_user:identity_local_only@postgres/identity
     depends_on:
       postgres:
         condition: service_healthy
