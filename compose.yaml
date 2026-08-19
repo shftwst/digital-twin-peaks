@@ -1,0 +1,42 @@
+name: enterprise-twins
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: twins_admin
+      POSTGRES_PASSWORD: local_admin_only
+      POSTGRES_DB: postgres
+    volumes:
+      - twin-postgres:/var/lib/postgresql
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U twins_admin -d postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks: [twin-integration, twin-control]
+
+  test-runner:
+    profiles: [test]
+    build:
+      context: .
+      target: test
+    environment:
+      TEST_DATABASE_URL: postgresql+asyncpg://platform_test_user:platform_test_local_only@postgres/platform_test
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [twin-integration, twin-control]
+    command: ["python", "-c", "import time; time.sleep(10**9)"]
+
+volumes:
+  twin-postgres:
+
+networks:
+  twin-public: {}
+  twin-integration:
+    internal: true
+  twin-webhook-egress:
+    internal: true
+  twin-control:
+    internal: true
