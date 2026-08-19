@@ -7,6 +7,7 @@ COPY src ./src
 RUN uv sync --locked --no-dev
 
 FROM build AS test
+COPY tests ./tests
 RUN uv sync --locked --all-groups
 ENTRYPOINT ["uv", "run"]
 

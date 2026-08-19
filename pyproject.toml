@@ -36,6 +36,9 @@ dev = [
 addopts = "--strict-config --strict-markers"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+  "integration: requires the Compose PostgreSQL service",
+]
 
 [tool.ruff]
 line-length = 100
