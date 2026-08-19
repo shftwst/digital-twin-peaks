@@ -37,7 +37,7 @@ def control_router(repository: ControlRepository, settings: ControlSettings) -> 
     async def advance_time(request: AdvanceClockRequest, _auth: ControllerAuth) -> ClockValue:
         try:
             amount = parse_duration(request.duration)
-        except ValueError as error:
+        except (OverflowError, ValueError) as error:
             raise ApiError(ErrorCode.INVALID_REQUEST, str(error), status_code=422) from error
         state = await repository.state()
         return ClockValue(

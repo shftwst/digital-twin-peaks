@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_twins.common.http.app import create_app
@@ -12,13 +13,16 @@ class ControlStatus:
         self.repository = repository
 
     async def current_epoch(self) -> str:
-        return (await self.repository.state()).active_epoch
+        try:
+            return (await self.repository.state()).active_epoch
+        except OSError, RuntimeError, SQLAlchemyError:
+            return "none"
 
     async def readiness(self) -> tuple[bool, dict[str, str]]:
         try:
             state = await self.repository.state()
             await self.repository.now()
-        except RuntimeError:
+        except OSError, RuntimeError, SQLAlchemyError:
             return False, {"database": "not_ready", "clock": "not_ready"}
         ready = state.mode == "active"
         return ready, {"database": "ready", "clock": "ready", "scenario": state.mode}

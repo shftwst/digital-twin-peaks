@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -26,8 +26,9 @@ class ControlRepository:
             return clock.now
 
     async def set_time(self, value: datetime) -> datetime:
-        if value.tzinfo is None:
+        if value.utcoffset() is None:
             raise ValueError("virtual time must include a UTC offset")
+        value = value.astimezone(UTC)
         async with self.factory.begin() as session:
             clock = await session.scalar(
                 select(VirtualClock).where(VirtualClock.singleton_id == 1).with_for_update()
