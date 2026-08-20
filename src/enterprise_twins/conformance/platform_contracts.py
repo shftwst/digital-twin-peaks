@@ -18,11 +18,13 @@ from typing import Any, cast
 
 import httpx
 
+from enterprise_twins.common.auth.credentials import validate_private_credential
 from enterprise_twins.common.canonical import canonical_json
 from enterprise_twins.topology import (
     NETWORK_INTERNAL,
     PLAN_ONE_SERVICE_NETWORKS,
     PRIVATE_PROBE_TARGETS,
+    endpoint_manifest_runtime_evidence,
     validate_compose_topology,
 )
 from enterprise_twins.topology import validate_network_evidence as validate_topology_evidence
@@ -1074,6 +1076,14 @@ class Driver:
         self.crm = os.environ["CRM_URL"].rstrip("/")
         self.control = os.environ["CONTROL_URL"].rstrip("/")
         self.receiver = os.environ["RECEIVER_URL"].rstrip("/")
+        self.control_headers = {
+            "Authorization": (f"Bearer {validate_private_credential(os.environ['CONTROL_TOKEN'])}"),
+        }
+        self.receiver_headers = {
+            "Authorization": (
+                f"Bearer {validate_private_credential(os.environ['RECEIVER_TOKEN'])}"
+            ),
+        }
         self.run_id = os.environ["CONFORMANCE_RUN_ID"]
         self.artifacts = Path(os.environ["ARTIFACT_ROOT"])
         if self.artifacts.exists():
@@ -1081,12 +1091,6 @@ class Driver:
                 raise AssertionError("new conformance run directory is not empty")
         else:
             self.artifacts.mkdir(parents=True)
-        self.control_headers = {
-            "Authorization": f"Bearer {os.environ['CONTROL_TOKEN']}",
-        }
-        self.receiver_headers = {
-            "Authorization": f"Bearer {os.environ['RECEIVER_TOKEN']}",
-        }
         self.client = httpx.AsyncClient(timeout=10.0, trust_env=False)
         self.success_calls: Transcript = []
         self.failure_calls: Transcript = []
@@ -1098,16 +1102,18 @@ class Driver:
         self.crm = os.environ["CRM_URL"].rstrip("/")
         self.control = os.environ["CONTROL_URL"].rstrip("/")
         self.receiver = os.environ["RECEIVER_URL"].rstrip("/")
+        self.control_headers = {
+            "Authorization": (f"Bearer {validate_private_credential(os.environ['CONTROL_TOKEN'])}"),
+        }
+        self.receiver_headers = {
+            "Authorization": (
+                f"Bearer {validate_private_credential(os.environ['RECEIVER_TOKEN'])}"
+            ),
+        }
         self.run_id = os.environ["CONFORMANCE_RUN_ID"]
         self.artifacts = Path(os.environ["ARTIFACT_ROOT"])
         if not self.artifacts.is_dir():
             raise AssertionError("conformance run directory does not exist")
-        self.control_headers = {
-            "Authorization": f"Bearer {os.environ['CONTROL_TOKEN']}",
-        }
-        self.receiver_headers = {
-            "Authorization": f"Bearer {os.environ['RECEIVER_TOKEN']}",
-        }
         self.client = httpx.AsyncClient(timeout=10.0, trust_env=False)
         self.success_calls = []
         self.failure_calls = []
@@ -2872,6 +2878,14 @@ def record_network_proof(artifact_root: Path, run_id: str) -> None:
         run_command([docker, "compose", "--profile", "test", "config", "--format", "json"]).stdout
     )
     static = validate_compose_topology(configuration)
+    endpoint_manifest_container = run_command(
+        [docker, "compose", "ps", "--all", "-q", "endpoint-manifest"]
+    ).stdout.strip()
+    if not endpoint_manifest_container:
+        raise AssertionError("endpoint manifest container is absent")
+    endpoint_manifest_runtime = endpoint_manifest_runtime_evidence(
+        inspect_json(docker, endpoint_manifest_container)
+    )
 
     runtime_networks: dict[str, list[str]] = {}
     host_bindings: dict[str, object] = {}
@@ -2989,6 +3003,10 @@ print(json.dumps(results, sort_keys=True))
             "workerExposedPorts": exposed_ports,
         },
         "workerCommand": worker_configuration.get("Cmd"),
+        "endpointManifest": {
+            "compose": static["endpointManifest"],
+            "runtime": endpoint_manifest_runtime,
+        },
     }
     validate_topology_evidence(payload)
     check_no_sensitive_values(payload)

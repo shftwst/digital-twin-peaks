@@ -8,6 +8,7 @@ from enterprise_twins.conformance.platform_contracts import (
     Driver,
     check_no_sensitive_values,
     publish_latest,
+    validate_network_evidence,
 )
 
 REQUIRED_SUCCESS_OPERATIONS = {
@@ -925,6 +926,57 @@ def valid_network_evidence() -> dict[str, object]:
             "workerExposedPorts": [],
         },
         "workerCommand": ["enterprise_twins.services.relay.delivery"],
+        "endpointManifest": {
+            "compose": {
+                "command": [
+                    "enterprise_twins.endpoint_manifest",
+                    "--output",
+                    "/output/manifest-v1.json",
+                    "--identity-container-url",
+                    "http://identity:8000",
+                    "--identity-loopback-url",
+                    "http://127.0.0.1:8101",
+                    "--crm-container-url",
+                    "http://crm:8000",
+                    "--crm-loopback-url",
+                    "http://127.0.0.1:8102",
+                ],
+                "dependsOn": [],
+                "environmentKeys": [],
+                "hostPorts": [],
+                "networkMode": "none",
+                "networks": [],
+                "outputMounts": [{"readOnly": False, "target": "/output", "type": "bind"}],
+                "readOnlyRootFilesystem": True,
+                "restart": None,
+                "user": "0:0",
+            },
+            "runtime": {
+                "command": [
+                    "enterprise_twins.endpoint_manifest",
+                    "--output",
+                    "/output/manifest-v1.json",
+                    "--identity-container-url",
+                    "http://identity:8000",
+                    "--identity-loopback-url",
+                    "http://127.0.0.1:8101",
+                    "--crm-container-url",
+                    "http://crm:8000",
+                    "--crm-loopback-url",
+                    "http://127.0.0.1:8102",
+                ],
+                "credentialEnvironmentKeys": [],
+                "exitCode": 0,
+                "hostBindings": {},
+                "networkAttachments": [],
+                "networkMode": "none",
+                "outputMounts": [{"destination": "/output", "readWrite": True, "type": "bind"}],
+                "readOnlyRootFilesystem": True,
+                "restartPolicy": {"maximumRetryCount": 0, "name": "no"},
+                "status": "exited",
+                "user": "0:0",
+            },
+        },
     }
 
 
@@ -943,6 +995,55 @@ def test_summary_accepts_exhaustive_canonical_network_evidence(tmp_path: Path) -
 
     summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert summary["networkIsolation"] == "passed"
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "replacement"),
+    [
+        ("compose", "networkMode", None),
+        ("compose", "networks", ["twin-control"]),
+        ("compose", "environmentKeys", ["CONTROL_TOKEN"]),
+        (
+            "compose",
+            "hostPorts",
+            [{"host_ip": "127.0.0.1", "published": "8199", "target": 8000}],
+        ),
+        ("compose", "readOnlyRootFilesystem", False),
+        ("compose", "restart", "on-failure"),
+        ("runtime", "networkMode", "default"),
+        ("runtime", "networkAttachments", ["twin-control"]),
+        ("runtime", "credentialEnvironmentKeys", ["CONTROL_TOKEN"]),
+        (
+            "runtime",
+            "hostBindings",
+            {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8199"}]},
+        ),
+        ("runtime", "readOnlyRootFilesystem", False),
+        ("runtime", "status", "running"),
+        ("runtime", "exitCode", 1),
+        (
+            "runtime",
+            "restartPolicy",
+            {"maximumRetryCount": 0, "name": "on-failure"},
+        ),
+    ],
+)
+def test_network_evidence_requires_exact_endpoint_manifest_auxiliary_isolation(
+    section: str,
+    field: str,
+    replacement: object,
+) -> None:
+    evidence = {"runId": "run-endpoint-manifest"} | valid_network_evidence()
+    validate_network_evidence(evidence)
+    mutated = deepcopy(evidence)
+    endpoint_manifest = mutated["endpointManifest"]
+    assert isinstance(endpoint_manifest, dict)
+    values = endpoint_manifest[section]
+    assert isinstance(values, dict)
+    values[field] = replacement
+
+    with pytest.raises(AssertionError, match="network evidence"):
+        validate_network_evidence(mutated)
 
 
 def call_for(calls: list[dict[str, object]], operation: str) -> dict[str, object]:
@@ -1905,3 +2006,40 @@ async def test_driver_uses_an_empty_host_created_run_directory(
     await driver.close()
 
     assert driver.artifacts == run_root
+
+
+@pytest.mark.parametrize("constructor", ["new", "resume"])
+@pytest.mark.parametrize("token_name", ["CONTROL_TOKEN", "RECEIVER_TOKEN"])
+def test_driver_rejects_each_invalid_configured_token_before_http_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    constructor: str,
+    token_name: str,
+) -> None:
+    run_root = tmp_path / "runs" / f"run-invalid-{constructor}-{token_name.lower()}"
+    if constructor == "resume":
+        run_root.mkdir(parents=True)
+    environment = {
+        "IDENTITY_URL": "http://identity:8000",
+        "CRM_URL": "http://crm:8000",
+        "CONTROL_URL": "http://control:8000",
+        "RECEIVER_URL": "http://webhook-receiver:8080",
+        "CONFORMANCE_RUN_ID": "run-invalid-token",
+        "ARTIFACT_ROOT": str(run_root),
+        "CONTROL_TOKEN": "test-control-token",
+        "RECEIVER_TOKEN": "test-receiver-token",
+    }
+    environment[token_name] = "padding=inside"
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    def unexpected_client(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("HTTP client was constructed")
+
+    monkeypatch.setattr(
+        "enterprise_twins.conformance.platform_contracts.httpx.AsyncClient",
+        unexpected_client,
+    )
+
+    with pytest.raises(ValueError, match="credential"):
+        Driver() if constructor == "new" else Driver.resume()

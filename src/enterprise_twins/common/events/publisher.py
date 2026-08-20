@@ -91,6 +91,7 @@ class OutboxDispatcher:
         self.relay = relay
 
     async def run_once(self) -> int:
+        failure: ApiError | httpx.HTTPError | None = None
         async with self.factory.begin() as session:
             state = await session.get(ScenarioState, 1)
             if state is None or state.mode != "active":
@@ -110,11 +111,14 @@ class OutboxDispatcher:
             record.publish_attempts += 1
             try:
                 await self.relay.ingest(EventEnvelope.model_validate(record.envelope))
-            except ApiError, httpx.HTTPError:
-                return 0
-            record.published = True
-            record.published_at = datetime.now(UTC)
-            return 1
+            except (ApiError, httpx.HTTPError) as error:
+                failure = error
+            else:
+                record.published = True
+                record.published_at = datetime.now(UTC)
+        if failure is not None:
+            raise failure
+        return 1
 
 
 class Dispatcher(Protocol):

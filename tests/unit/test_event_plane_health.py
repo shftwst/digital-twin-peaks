@@ -145,3 +145,66 @@ async def test_relay_worker_persists_degraded_then_ready_health_on_recovery() ->
     worker.fail = False
     assert await run_worker_iteration(worker) == 0  # type: ignore[arg-type]
     assert heartbeats == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_relay_worker_persists_degraded_health_before_reraising_a_fatal_failure() -> None:
+    heartbeats: list[bool] = []
+
+    class Repository:
+        async def record_worker_heartbeat(self, _observed_at: object, *, ready: bool) -> None:
+            heartbeats.append(ready)
+
+    class Worker:
+        repository = Repository()
+
+        async def run_once(self) -> int:
+            raise RuntimeError("unsupported webhook delivery fault effect")
+
+    with pytest.raises(RuntimeError, match="unsupported webhook delivery fault effect"):
+        await run_worker_iteration(Worker())  # type: ignore[arg-type]
+
+    assert heartbeats == [False]
+
+
+@pytest.mark.asyncio
+async def test_relay_worker_preserves_a_fatal_failure_when_degraded_health_cannot_persist() -> None:
+    heartbeat_attempts = 0
+
+    class Repository:
+        async def record_worker_heartbeat(self, _observed_at: object, *, ready: bool) -> None:
+            nonlocal heartbeat_attempts
+            heartbeat_attempts += 1
+            assert ready is False
+            raise OSError("heartbeat database detail")
+
+    class Worker:
+        repository = Repository()
+
+        async def run_once(self) -> int:
+            raise RuntimeError("fatal worker detail")
+
+    with pytest.raises(RuntimeError, match="fatal worker detail"):
+        await run_worker_iteration(Worker())  # type: ignore[arg-type]
+
+    assert heartbeat_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_relay_worker_cancellation_propagates_without_recording_health() -> None:
+    heartbeats: list[bool] = []
+
+    class Repository:
+        async def record_worker_heartbeat(self, _observed_at: object, *, ready: bool) -> None:
+            heartbeats.append(ready)
+
+    class Worker:
+        repository = Repository()
+
+        async def run_once(self) -> int:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_worker_iteration(Worker())  # type: ignore[arg-type]
+
+    assert heartbeats == []

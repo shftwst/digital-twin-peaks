@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, cast
 
 JsonObject = dict[str, Any]
@@ -66,6 +67,52 @@ PRIVATE_PROBE_TARGETS = {
 }
 
 WORKER_COMMAND = ["enterprise_twins.services.relay.delivery"]
+ENDPOINT_MANIFEST_COMMAND = [
+    "enterprise_twins.endpoint_manifest",
+    "--output",
+    "/output/manifest-v1.json",
+    "--identity-container-url",
+    "http://identity:8000",
+    "--identity-loopback-url",
+    "http://127.0.0.1:8101",
+    "--crm-container-url",
+    "http://crm:8000",
+    "--crm-loopback-url",
+    "http://127.0.0.1:8102",
+]
+ENDPOINT_MANIFEST_COMPOSE_EVIDENCE: JsonObject = {
+    "command": ENDPOINT_MANIFEST_COMMAND,
+    "dependsOn": [],
+    "environmentKeys": [],
+    "hostPorts": [],
+    "networkMode": "none",
+    "networks": [],
+    "outputMounts": [
+        {"readOnly": False, "target": "/output", "type": "bind"},
+    ],
+    "readOnlyRootFilesystem": True,
+    "restart": None,
+    "user": "0:0",
+}
+ENDPOINT_MANIFEST_RUNTIME_EVIDENCE: JsonObject = {
+    "command": ENDPOINT_MANIFEST_COMMAND,
+    "credentialEnvironmentKeys": [],
+    "exitCode": 0,
+    "hostBindings": {},
+    "networkAttachments": [],
+    "networkMode": "none",
+    "outputMounts": [
+        {"destination": "/output", "readWrite": True, "type": "bind"},
+    ],
+    "readOnlyRootFilesystem": True,
+    "restartPolicy": {"maximumRetryCount": 0, "name": "no"},
+    "status": "exited",
+    "user": "0:0",
+}
+ENDPOINT_MANIFEST_EVIDENCE = {
+    "compose": ENDPOINT_MANIFEST_COMPOSE_EVIDENCE,
+    "runtime": ENDPOINT_MANIFEST_RUNTIME_EVIDENCE,
+}
 AUXILIARY_SERVICES = {"endpoint-manifest"}
 RESTART_SERVICES = {
     "control",
@@ -92,11 +139,125 @@ def _database_environment_keys(environment: object) -> list[str]:
     )
 
 
+def _mapping_keys(value: object, description: str) -> list[str]:
+    if value is None:
+        return []
+    return sorted(_object(value, description))
+
+
+def _mount_source_is_endpoint_directory(source: object) -> bool:
+    if not isinstance(source, str):
+        return False
+    return Path(source).parts[-2:] == ("artifacts", "endpoints")
+
+
+def endpoint_manifest_compose_evidence(service: Mapping[str, object]) -> JsonObject:
+    volumes = service.get("volumes") or []
+    if not isinstance(volumes, list):
+        raise AssertionError("endpoint manifest volumes are invalid")
+    mounts = [
+        {
+            "readOnly": _object(volume, "endpoint manifest volume").get("read_only", False),
+            "target": _object(volume, "endpoint manifest volume").get("target"),
+            "type": _object(volume, "endpoint manifest volume").get("type"),
+        }
+        for volume in volumes
+    ]
+    if len(volumes) != 1 or not _mount_source_is_endpoint_directory(
+        _object(volumes[0], "endpoint manifest volume").get("source")
+    ):
+        raise AssertionError("endpoint manifest output mount differs")
+    evidence: JsonObject = {
+        "command": service.get("command"),
+        "dependsOn": _mapping_keys(service.get("depends_on"), "endpoint manifest dependencies"),
+        "environmentKeys": _mapping_keys(
+            service.get("environment"), "endpoint manifest environment"
+        ),
+        "hostPorts": service.get("ports") or [],
+        "networkMode": service.get("network_mode"),
+        "networks": _mapping_keys(service.get("networks"), "endpoint manifest networks"),
+        "outputMounts": mounts,
+        "readOnlyRootFilesystem": service.get("read_only", False),
+        "restart": service.get("restart"),
+        "user": service.get("user"),
+    }
+    if evidence != ENDPOINT_MANIFEST_COMPOSE_EVIDENCE:
+        raise AssertionError("endpoint manifest Compose isolation differs")
+    return evidence
+
+
+def _credential_environment_keys(environment: object) -> list[str]:
+    if not isinstance(environment, list) or not all(
+        isinstance(value, str) for value in environment
+    ):
+        raise AssertionError("endpoint manifest runtime environment is invalid")
+    markers = (
+        "AUTHORIZATION",
+        "CREDENTIAL",
+        "DATABASE",
+        "PASSWORD",
+        "POSTGRES",
+        "SECRET",
+        "TOKEN",
+    )
+    return sorted(
+        value.partition("=")[0]
+        for value in environment
+        if any(marker in value.partition("=")[0].upper() for marker in markers)
+    )
+
+
+def endpoint_manifest_runtime_evidence(inspected: Mapping[str, object]) -> JsonObject:
+    configuration = _object(inspected.get("Config"), "endpoint manifest runtime configuration")
+    host = _object(inspected.get("HostConfig"), "endpoint manifest runtime host configuration")
+    network = _object(inspected.get("NetworkSettings"), "endpoint manifest network settings")
+    networks = _object(network.get("Networks"), "endpoint manifest runtime networks")
+    state = _object(inspected.get("State"), "endpoint manifest runtime state")
+    mounts_value = inspected.get("Mounts")
+    if not isinstance(mounts_value, list):
+        raise AssertionError("endpoint manifest runtime mounts are invalid")
+    mounts = [
+        {
+            "destination": _object(mount, "endpoint manifest runtime mount").get("Destination"),
+            "readWrite": _object(mount, "endpoint manifest runtime mount").get("RW"),
+            "type": _object(mount, "endpoint manifest runtime mount").get("Type"),
+        }
+        for mount in mounts_value
+    ]
+    if len(mounts_value) != 1 or not _mount_source_is_endpoint_directory(
+        _object(mounts_value[0], "endpoint manifest runtime mount").get("Source")
+    ):
+        raise AssertionError("endpoint manifest runtime output mount differs")
+    restart = _object(host.get("RestartPolicy"), "endpoint manifest restart policy")
+    evidence: JsonObject = {
+        "command": configuration.get("Cmd"),
+        "credentialEnvironmentKeys": _credential_environment_keys(configuration.get("Env")),
+        "exitCode": state.get("ExitCode"),
+        "hostBindings": host.get("PortBindings") or {},
+        "networkAttachments": sorted(name for name in networks if name != "none"),
+        "networkMode": host.get("NetworkMode"),
+        "outputMounts": mounts,
+        "readOnlyRootFilesystem": host.get("ReadonlyRootfs"),
+        "restartPolicy": {
+            "maximumRetryCount": restart.get("MaximumRetryCount"),
+            "name": restart.get("Name"),
+        },
+        "status": state.get("Status"),
+        "user": configuration.get("User"),
+    }
+    if evidence != ENDPOINT_MANIFEST_RUNTIME_EVIDENCE:
+        raise AssertionError("endpoint manifest runtime isolation differs")
+    return evidence
+
+
 def validate_compose_topology(configuration: Mapping[str, object]) -> JsonObject:
     services = _object(configuration.get("services"), "Compose services")
     expected_services = set(PLAN_ONE_SERVICE_NETWORKS) | AUXILIARY_SERVICES
     if set(services) != expected_services:
         raise AssertionError("effective Compose service set differs from the Plan 1 topology")
+    endpoint_manifest = endpoint_manifest_compose_evidence(
+        _object(services["endpoint-manifest"], "endpoint manifest Compose service")
+    )
 
     compose_networks: dict[str, list[str]] = {}
     for name, expected_networks in PLAN_ONE_SERVICE_NETWORKS.items():
@@ -148,6 +309,7 @@ def validate_compose_topology(configuration: Mapping[str, object]) -> JsonObject
     return {
         "composeNetworks": compose_networks,
         "composeNetworkInternal": network_internal,
+        "endpointManifest": endpoint_manifest,
     }
 
 
@@ -162,6 +324,7 @@ def validate_network_evidence(network: Mapping[str, object]) -> None:
         "publicProbeIsolation",
         "security",
         "workerCommand",
+        "endpointManifest",
     }
     expected_networks = {
         name: list(networks) for name, networks in PLAN_ONE_SERVICE_NETWORKS.items()
@@ -184,5 +347,6 @@ def validate_network_evidence(network: Mapping[str, object]) -> None:
         or network.get("publicProbeIsolation") != expected_probe
         or network.get("security") != expected_security
         or network.get("workerCommand") != WORKER_COMMAND
+        or network.get("endpointManifest") != ENDPOINT_MANIFEST_EVIDENCE
     ):
         raise AssertionError("network evidence does not match the isolated Plan 1 contract")

@@ -25,6 +25,25 @@ def install_http_boundary(monkeypatch: pytest.MonkeyPatch, requests: list[httpx.
     monkeypatch.setattr(cli, "client", make_client)
 
 
+@pytest.mark.parametrize(
+    "invalid_token",
+    ["embedded whitespace", "non-ascii-é", "padding=inside"],
+)
+def test_control_cli_rejects_an_invalid_configured_token_before_http_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_token: str,
+) -> None:
+    monkeypatch.setenv("TWINS_CONTROL_CONTROLLER_TOKEN", invalid_token)
+
+    def unexpected_client(*_args: object, **_kwargs: object) -> httpx.Client:
+        raise AssertionError("HTTP client was constructed")
+
+    monkeypatch.setattr(cli.httpx, "Client", unexpected_client)
+
+    with pytest.raises(ValueError, match="credential"):
+        cli.client()
+
+
 def test_reset_and_status_commands_use_controller_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

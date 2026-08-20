@@ -24,6 +24,7 @@ from enterprise_twins.common.auth.verifier import JwtVerifier
 from enterprise_twins.common.canonical import canonical_json
 from enterprise_twins.common.control.contracts import ClockValue, FaultDecision, FaultEffect
 from enterprise_twins.common.control.participant import ResetParticipant
+from enterprise_twins.common.db.idempotency import StoredResponse
 from enterprise_twins.common.db.records import (
     AuditRecord,
     IdempotencyRecord,
@@ -37,7 +38,11 @@ from enterprise_twins.services.crm.app import create_crm_app
 from enterprise_twins.services.crm.models import Customer, CustomerNote
 from enterprise_twins.services.crm.scenario import CrmScenarioLoader
 from enterprise_twins.services.crm.schemas import NoteCreate
-from enterprise_twins.services.crm.service import CrmService
+from enterprise_twins.services.crm.service import (
+    CrmService,
+    NoteWriteResult,
+    apply_post_commit_fault,
+)
 from enterprise_twins.services.crm.settings import CrmSettings
 from enterprise_twins.services.identity.issuer import TokenIssuer
 
@@ -731,6 +736,47 @@ async def test_after_commit_connection_loss_starts_response_and_retry_replays_co
         )
     assert customer is not None
     assert customer.version == 2
+
+
+@pytest.mark.asyncio
+async def test_note_create_fails_closed_for_an_unexpected_post_commit_fault(
+    crm_harness: CrmHarness,
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    crm_harness.control.decision = FaultDecision(effect=FaultEffect.FAILED_REFUND)
+
+    async with AsyncClient(
+        transport=httpx.ASGITransport(
+            app=crm_harness.app,
+            raise_app_exceptions=False,
+        ),
+        base_url="http://crm:8000",
+    ) as client:
+        response = await client.post(
+            "/v1/customers/cus_unique/notes",
+            headers=crm_harness.support_headers
+            | {"Idempotency-Key": "note-unsupported-fault", "If-Match": '"1"'},
+            json={"body": "committed before invalid decision", "association": "account"},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == ErrorCode.INTERNAL_ERROR
+    assert "failed_refund" not in response.text
+    assert await count(db, CustomerNote) == 2
+    assert await count(db, IdempotencyRecord) == 1
+    assert await count(db, OutboxRecord) == 1
+
+
+@pytest.mark.asyncio
+async def test_post_commit_fault_consumer_rejects_an_unexpected_effect() -> None:
+    result = NoteWriteResult(
+        StoredResponse(201, {"noteId": "note_1"}, {}),
+        replayed=False,
+        fault=FaultDecision(effect=FaultEffect.FAILED_REFUND),
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported CRM note fault effect"):
+        await apply_post_commit_fault(result)
 
 
 @pytest.mark.asyncio

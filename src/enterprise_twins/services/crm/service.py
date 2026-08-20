@@ -15,6 +15,7 @@ from enterprise_twins.common.control.contracts import (
     FaultPhase,
     FaultProbe,
 )
+from enterprise_twins.common.control.fault_capabilities import FAULT_CAPABILITIES
 from enterprise_twins.common.db.idempotency import (
     IdempotencyNamespace,
     StoredResponse,
@@ -45,6 +46,9 @@ class CrmControl(Protocol):
 
     async def evaluate_fault(self, probe: FaultProbe) -> FaultDecision:
         raise NotImplementedError
+
+
+CRM_NOTE_FAULT_EFFECTS = FAULT_CAPABILITIES[("crm", "crm.note.create", FaultPhase.AFTER_COMMIT)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,9 +203,13 @@ class CrmService:
                 requestHash=sha256_hex(request.model_dump(mode="json")),
             )
         )
+        if fault.effect is not None and fault.effect not in CRM_NOTE_FAULT_EFFECTS:
+            raise RuntimeError("unsupported CRM note fault effect")
         return NoteWriteResult(response, replayed, fault)
 
 
 async def apply_post_commit_fault(result: NoteWriteResult) -> None:
+    if result.fault.effect is not None and result.fault.effect not in CRM_NOTE_FAULT_EFFECTS:
+        raise RuntimeError("unsupported CRM note fault effect")
     if result.fault.effect == FaultEffect.TIMEOUT:
         await asyncio.sleep((result.fault.delay_ms or 250) / 1000)

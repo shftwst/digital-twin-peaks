@@ -4,6 +4,8 @@ from pathlib import Path
 import httpx
 import typer
 
+from enterprise_twins.common.auth.credentials import validate_private_credential
+
 app = typer.Typer(no_args_is_help=True)
 time_app = typer.Typer()
 faults_app = typer.Typer()
@@ -12,9 +14,10 @@ app.add_typer(faults_app, name="faults")
 
 
 def client() -> httpx.Client:
+    token = validate_private_credential(os.environ["TWINS_CONTROL_CONTROLLER_TOKEN"])
     return httpx.Client(
         base_url=os.environ.get("TWINS_CONTROL_CLI_URL", "http://127.0.0.1:8000"),
-        headers={"Authorization": f"Bearer {os.environ['TWINS_CONTROL_CONTROLLER_TOKEN']}"},
+        headers={"Authorization": f"Bearer {token}"},
         timeout=10,
     )
 

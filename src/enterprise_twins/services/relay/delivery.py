@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -142,6 +143,10 @@ async def run_worker_iteration(
     except ApiError, httpx.HTTPError, SQLAlchemyError:
         await worker.repository.record_worker_heartbeat(wall_clock(), ready=False)
         return 0
+    except Exception:
+        with suppress(Exception):
+            await worker.repository.record_worker_heartbeat(wall_clock(), ready=False)
+        raise
     await worker.repository.record_worker_heartbeat(wall_clock(), ready=True)
     return processed
 

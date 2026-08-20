@@ -1,8 +1,7 @@
 # Enterprise digital twins implementation programme
 
 The numbered plans below are technical increments within refund Release 1,
-not separate business releases. Supplier onboarding is the second future
-business release.
+not separate business releases. Supplier onboarding is future Release 2.
 
 Status: Approved design split into executable plans  
 Date: 2026-08-19  

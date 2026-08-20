@@ -7,7 +7,7 @@ defines the wider refund estate. The [future-twin specification guide](superpowe
 defines how to specify later systems and workflows.
 
 The numbered technical plans all build refund Release 1; they are not separate
-business releases. Supplier onboarding is the second future business release.
+business releases. Supplier onboarding is future Release 2.
 
 ## Start and control the estate
 

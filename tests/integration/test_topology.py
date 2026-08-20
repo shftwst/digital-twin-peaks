@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -116,6 +117,22 @@ def test_service_network_membership_matches_the_platform_boundary() -> None:
     )
 
 
+def test_endpoint_manifest_auxiliary_isolation_is_part_of_the_compose_contract() -> None:
+    require_host_topology()
+    configuration = compose_configuration()
+    mutated = deepcopy(configuration)
+    services = mutated["services"]
+    assert isinstance(services, dict)
+    writer = services["endpoint-manifest"]
+    assert isinstance(writer, dict)
+    writer.pop("network_mode")
+    writer["networks"] = {"twin-control": None}
+    writer["environment"] = {"CONTROL_TOKEN": "private-marker"}
+
+    with pytest.raises(AssertionError, match="endpoint manifest"):
+        validate_compose_topology(mutated)
+
+
 def test_endpoint_manifest_matches_effective_compose_and_contains_only_business_urls() -> None:
     require_host_topology()
     configuration = compose_configuration()
@@ -221,4 +238,55 @@ def test_canonical_runtime_network_proof_is_exhaustive(tmp_path: Path) -> None:
             "identity-admin",
             "crm-admin",
         )
+    }
+    assert evidence["endpointManifest"] == {
+        "compose": {
+            "command": [
+                "enterprise_twins.endpoint_manifest",
+                "--output",
+                "/output/manifest-v1.json",
+                "--identity-container-url",
+                "http://identity:8000",
+                "--identity-loopback-url",
+                "http://127.0.0.1:8101",
+                "--crm-container-url",
+                "http://crm:8000",
+                "--crm-loopback-url",
+                "http://127.0.0.1:8102",
+            ],
+            "dependsOn": [],
+            "environmentKeys": [],
+            "hostPorts": [],
+            "networkMode": "none",
+            "networks": [],
+            "outputMounts": [{"readOnly": False, "target": "/output", "type": "bind"}],
+            "readOnlyRootFilesystem": True,
+            "restart": None,
+            "user": "0:0",
+        },
+        "runtime": {
+            "command": [
+                "enterprise_twins.endpoint_manifest",
+                "--output",
+                "/output/manifest-v1.json",
+                "--identity-container-url",
+                "http://identity:8000",
+                "--identity-loopback-url",
+                "http://127.0.0.1:8101",
+                "--crm-container-url",
+                "http://crm:8000",
+                "--crm-loopback-url",
+                "http://127.0.0.1:8102",
+            ],
+            "credentialEnvironmentKeys": [],
+            "exitCode": 0,
+            "hostBindings": {},
+            "networkAttachments": [],
+            "networkMode": "none",
+            "outputMounts": [{"destination": "/output", "readWrite": True, "type": "bind"}],
+            "readOnlyRootFilesystem": True,
+            "restartPolicy": {"maximumRetryCount": 0, "name": "no"},
+            "status": "exited",
+            "user": "0:0",
+        },
     }

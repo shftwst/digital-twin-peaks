@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 
 import httpx
@@ -13,7 +14,7 @@ from enterprise_twins.common.events.contracts import (
     WebhookSubscriptionCreate,
     WebhookSubscriptionView,
 )
-from enterprise_twins.common.events.publisher import OutboxDispatcher
+from enterprise_twins.common.events.publisher import DispatcherSupervisor, OutboxDispatcher
 from enterprise_twins.common.events.relay_client import RelayClient
 from enterprise_twins.common.http.app import create_app
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
@@ -569,13 +570,92 @@ async def test_relay_client_redirect_is_retryable_and_outbox_remains_unpublished
             await relay.ingest(event)
         assert error.value.code == ErrorCode.TEMPORARILY_UNAVAILABLE
         assert error.value.retryable is True
-        assert await OutboxDispatcher(db, relay).run_once() == 0
+        with pytest.raises(ApiError) as dispatch_error:
+            await OutboxDispatcher(db, relay).run_once()
+        assert dispatch_error.value.code == ErrorCode.TEMPORARILY_UNAVAILABLE
 
     async with db() as session:
         record = await session.get(OutboxRecord, event.event_id)
     assert record is not None
     assert record.published is False
     assert record.publish_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_outbox_failure_makes_the_supervisor_not_ready_until_relay_recovers(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    await initialise_relay(db)
+    relay_available = False
+
+    async def relay_response(_request: httpx.Request) -> httpx.Response:
+        if relay_available:
+            return httpx.Response(202, json={"accepted": True})
+        return httpx.Response(
+            401,
+            json={
+                "error": {
+                    "code": "unauthenticated",
+                    "message": "private bad source credential",
+                    "retryable": False,
+                    "requestId": "private-request",
+                    "details": {},
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(relay_response)) as client:
+        relay = RelayClient("http://relay", "crm", "source-secret", client)
+        supervisor = DispatcherSupervisor(
+            OutboxDispatcher(db, relay),
+            interval_seconds=0.01,
+            freshness_seconds=1,
+        )
+        task = supervisor.start()
+        try:
+            for _ in range(100):
+                if supervisor.is_ready():
+                    break
+                await asyncio.sleep(0.01)
+            assert supervisor.is_ready() is True
+
+            event = source_event(eventId="evt_supervisor")
+            async with db.begin() as session:
+                session.add(
+                    OutboxRecord(
+                        event_id=event.event_id,
+                        scenario_epoch="epoch_1",
+                        event_type=event.event_type,
+                        envelope=event.model_dump(mode="json", by_alias=True),
+                        published=False,
+                        publish_attempts=0,
+                    )
+                )
+
+            for _ in range(100):
+                async with db() as session:
+                    record = await session.get(OutboxRecord, event.event_id)
+                if record is not None and record.publish_attempts > 0:
+                    break
+                await asyncio.sleep(0.01)
+            assert record is not None
+            assert record.published is False
+            assert record.publish_attempts > 0
+            assert supervisor.is_ready() is False
+
+            relay_available = True
+            for _ in range(100):
+                async with db() as session:
+                    record = await session.get(OutboxRecord, event.event_id)
+                if record is not None and record.published and supervisor.is_ready():
+                    break
+                await asyncio.sleep(0.01)
+            assert record is not None
+            assert record.published is True
+            assert supervisor.is_ready() is True
+            assert task.done() is False
+        finally:
+            await supervisor.stop()
 
 
 @pytest.mark.asyncio
