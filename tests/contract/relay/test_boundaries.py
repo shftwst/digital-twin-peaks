@@ -3,11 +3,11 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_twins.common.control.contracts import ClockValue, FaultDecision
-from enterprise_twins.common.db.records import OutboxRecord, ScenarioState
+from enterprise_twins.common.db.records import IdempotencyRecord, OutboxRecord, ScenarioState
 from enterprise_twins.common.events.contracts import (
     EventEnvelope,
     WebhookSubscriptionCreate,
@@ -19,6 +19,7 @@ from enterprise_twins.common.http.app import create_app
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.relay.api import relay_router
 from enterprise_twins.services.relay.app import RelayStatus
+from enterprise_twins.services.relay.models import SourceEvent, Subscription
 from enterprise_twins.services.relay.repository import RelayRepository
 from enterprise_twins.services.relay.settings import RelaySettings
 
@@ -40,6 +41,27 @@ class Clock:
 
     async def evaluate_fault(self, probe: object) -> FaultDecision:
         return FaultDecision()
+
+
+class SnapshotClock(Clock):
+    def __init__(self, epoch: str = "epoch_1", *, unavailable: bool = False) -> None:
+        self.epoch = epoch
+        self.unavailable = unavailable
+        self.snapshot_calls = 0
+
+    async def snapshot(self) -> ClockValue:
+        self.snapshot_calls += 1
+        if self.unavailable:
+            raise ApiError(
+                ErrorCode.TEMPORARILY_UNAVAILABLE,
+                "Control is temporarily unavailable",
+                status_code=503,
+                retryable=True,
+            )
+        return ClockValue(now=NOW, scenarioEpoch=self.epoch)
+
+    async def now(self) -> datetime:
+        raise AssertionError("Relay business routes must use one Control snapshot")
 
 
 def event_values(**overrides: object) -> dict[str, object]:
@@ -82,12 +104,68 @@ def settings() -> RelaySettings:
 def relay_app(
     db: async_sessionmaker[AsyncSession],
     repository: RelayRepository,
+    control: Clock | None = None,
 ) -> object:
+    selected_control = control or Clock()
     return create_app(
         "Relay probe",
         (),
-        RelayStatus(db, Clock()),
-        (relay_router(repository, Clock(), settings()),),  # type: ignore[arg-type]
+        RelayStatus(db, selected_control),  # type: ignore[arg-type]
+        (relay_router(repository, selected_control, settings()),),  # type: ignore[arg-type]
+    )
+
+
+async def seed_subscription(db: async_sessionmaker[AsyncSession]) -> None:
+    async with db.begin() as session:
+        session.add(
+            Subscription(
+                row_id="subrow_existing",
+                subscription_id="sub_existing",
+                scenario_epoch="epoch_1",
+                source="crm",
+                event_types=["crm.note.created"],
+                target_url="http://webhook-receiver:8080/events",
+                signing_secret="existing-signing-secret",  # noqa: S106
+                version=1,
+                active=True,
+                created_at=NOW,
+            )
+        )
+
+
+async def invoke_business_route(client: httpx.AsyncClient, operation: str) -> httpx.Response:
+    if operation == "create":
+        return await client.post(
+            "/internal/v1/sources/crm/subscriptions",
+            headers={
+                "Authorization": "Bearer crm-source-secret",
+                "Idempotency-Key": "epoch-fence-create",
+                "X-Caller-Id": "person-support-1",
+            },
+            json={
+                "eventTypes": ["crm.note.created"],
+                "targetUrl": "http://webhook-receiver:8080/events",
+            },
+        )
+    if operation == "list":
+        return await client.get(
+            "/internal/v1/sources/crm/subscriptions",
+            headers={"Authorization": "Bearer crm-source-secret"},
+        )
+    if operation == "delete":
+        return await client.delete(
+            "/internal/v1/sources/crm/subscriptions/sub_existing",
+            headers={
+                "Authorization": "Bearer crm-source-secret",
+                "Idempotency-Key": "epoch-fence-delete",
+                "X-Caller-Id": "person-support-1",
+                "If-Match": '"1"',
+            },
+        )
+    return await client.post(
+        "/internal/v1/events",
+        headers={"Authorization": "Bearer crm-source-secret"},
+        json=event_values(),
     )
 
 
@@ -196,6 +274,192 @@ async def test_source_routes_reject_noncanonical_bearer_headers_before_repositor
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "unauthenticated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "list", "delete", "ingest"])
+@pytest.mark.parametrize(
+    "failure",
+    ["control_unavailable", "epoch_mismatch", "local_inactive"],
+)
+async def test_every_business_route_requires_one_matching_control_snapshot_before_repository_work(
+    db: async_sessionmaker[AsyncSession],
+    operation: str,
+    failure: str,
+) -> None:
+    repository = await initialise_relay(db)
+    await seed_subscription(db)
+    if failure == "local_inactive":
+        async with db.begin() as session:
+            state = await session.get(ScenarioState, 1)
+            assert state is not None
+            state.mode = "preparing"
+    control = SnapshotClock(
+        epoch="epoch_new" if failure == "epoch_mismatch" else "epoch_1",
+        unavailable=failure == "control_unavailable",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=relay_app(db, repository, control)),
+        base_url="http://relay",
+    ) as client:
+        response = await invoke_business_route(client, operation)
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "temporarily_unavailable"
+    assert response.json()["error"]["retryable"] is True
+    assert response.headers["X-Scenario-Epoch"] == "epoch_1"
+    assert control.snapshot_calls == 1
+    async with db() as session:
+        subscription_count = await session.scalar(select(func.count()).select_from(Subscription))
+        source_event_count = await session.scalar(select(func.count()).select_from(SourceEvent))
+        idempotency_count = await session.scalar(
+            select(func.count()).select_from(IdempotencyRecord)
+        )
+        subscription = await session.get(Subscription, "subrow_existing")
+    assert subscription_count == 1
+    assert source_event_count == 0
+    assert idempotency_count == 0
+    assert subscription is not None
+    assert subscription.active is True
+    assert subscription.version == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "list", "delete", "ingest"])
+async def test_every_business_route_uses_exactly_one_control_snapshot_on_success(
+    db: async_sessionmaker[AsyncSession],
+    operation: str,
+) -> None:
+    repository = await initialise_relay(db)
+    await seed_subscription(db)
+    control = SnapshotClock()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=relay_app(db, repository, control)),
+        base_url="http://relay",
+    ) as client:
+        response = await invoke_business_route(client, operation)
+
+    assert (
+        response.status_code
+        == {
+            "create": 201,
+            "list": 200,
+            "delete": 204,
+            "ingest": 202,
+        }[operation]
+    )
+    assert control.snapshot_calls == 1
+    if operation == "create":
+        async with db() as session:
+            created = await session.scalar(
+                select(Subscription).where(Subscription.row_id != "subrow_existing")
+            )
+        assert created is not None
+        assert created.created_at == NOW
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "unauthorised_create",
+        "unauthorised_list",
+        "unauthorised_delete",
+        "unauthorised_ingest",
+        "invalid_create",
+        "invalid_delete",
+        "invalid_ingest",
+    ],
+)
+async def test_invalid_auth_and_inputs_stop_before_control_or_repository_work(
+    db: async_sessionmaker[AsyncSession],
+    boundary: str,
+) -> None:
+    repository = await initialise_relay(db)
+    await seed_subscription(db)
+    control = SnapshotClock(unavailable=True)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=relay_app(db, repository, control)),
+        base_url="http://relay",
+    ) as client:
+        if boundary == "unauthorised_create":
+            response = await client.post(
+                "/internal/v1/sources/crm/subscriptions",
+                headers={
+                    "Authorization": "Bearer wrong",
+                    "Idempotency-Key": "invalid-auth-create",
+                    "X-Caller-Id": "person-support-1",
+                },
+                json={
+                    "eventTypes": ["crm.note.created"],
+                    "targetUrl": "http://webhook-receiver:8080/events",
+                },
+            )
+        elif boundary == "unauthorised_list":
+            response = await client.get(
+                "/internal/v1/sources/crm/subscriptions",
+                headers={"Authorization": "Bearer wrong"},
+            )
+        elif boundary == "unauthorised_delete":
+            response = await client.delete(
+                "/internal/v1/sources/crm/subscriptions/sub_existing",
+                headers={
+                    "Authorization": "Bearer wrong",
+                    "Idempotency-Key": "invalid-auth-delete",
+                    "X-Caller-Id": "person-support-1",
+                    "If-Match": '"1"',
+                },
+            )
+        elif boundary == "unauthorised_ingest":
+            response = await client.post(
+                "/internal/v1/events",
+                headers={"Authorization": "Bearer wrong"},
+                json=event_values(),
+            )
+        elif boundary == "invalid_create":
+            response = await client.post(
+                "/internal/v1/sources/crm/subscriptions",
+                headers={
+                    "Authorization": "Bearer crm-source-secret",
+                    "Idempotency-Key": "invalid-input-create",
+                    "X-Caller-Id": "person-support-1",
+                },
+                json={
+                    "eventTypes": [],
+                    "targetUrl": "http://webhook-receiver:8080/events",
+                },
+            )
+        elif boundary == "invalid_delete":
+            response = await client.delete(
+                "/internal/v1/sources/crm/subscriptions/sub_existing",
+                headers={
+                    "Authorization": "Bearer crm-source-secret",
+                    "Idempotency-Key": "invalid-input-delete",
+                    "X-Caller-Id": "person-support-1",
+                    "If-Match": "1",
+                },
+            )
+        else:
+            response = await client.post(
+                "/internal/v1/events",
+                headers={"Authorization": "Bearer crm-source-secret"},
+                json=event_values(eventId="e" * 65),
+            )
+
+    assert response.status_code == (401 if boundary.startswith("unauthorised") else 422)
+    assert control.snapshot_calls == 0
+    async with db() as session:
+        subscription_count = await session.scalar(select(func.count()).select_from(Subscription))
+        source_event_count = await session.scalar(select(func.count()).select_from(SourceEvent))
+        idempotency_count = await session.scalar(
+            select(func.count()).select_from(IdempotencyRecord)
+        )
+        subscription = await session.get(Subscription, "subrow_existing")
+    assert subscription_count == 1
+    assert source_event_count == 0
+    assert idempotency_count == 0
+    assert subscription is not None
+    assert subscription.active is True
 
 
 @pytest.mark.asyncio
@@ -529,7 +793,7 @@ async def test_relay_business_call_reports_control_outage_as_retryable_503(
     repository = await initialise_relay(db)
 
     class UnavailableClock(Clock):
-        async def now(self) -> datetime:
+        async def snapshot(self) -> ClockValue:
             raise ApiError(
                 ErrorCode.TEMPORARILY_UNAVAILABLE,
                 "Control is temporarily unavailable",

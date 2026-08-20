@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 
 import pytest
@@ -69,6 +70,144 @@ class Participant:
             raise RuntimeError(f"{self.name} finalize failed")
 
 
+class InterruptibleParticipant(Participant):
+    def __init__(
+        self,
+        name: str,
+        *,
+        cancel_on: str | None = None,
+        fail_on: str | None = None,
+        abort_failures: int = 0,
+        abort_always: bool = False,
+    ) -> None:
+        super().__init__(name, fail_on=fail_on)
+        self.cancel_on = cancel_on
+        self.abort_failures = abort_failures
+        self.abort_always = abort_always
+
+    async def prepare(self, epoch: str) -> None:
+        await super().prepare(epoch)
+        if self.cancel_on == "prepare":
+            raise asyncio.CancelledError
+
+    async def load(self, request: ParticipantLoadRequest) -> ParticipantReport:
+        if self.cancel_on == "load":
+            self.calls.append(("load", request.scenario_epoch))
+            raise asyncio.CancelledError
+        return await super().load(request)
+
+    async def commit(self, epoch: str) -> None:
+        if self.cancel_on == "commit":
+            self.calls.append(("commit", epoch))
+            raise asyncio.CancelledError
+        await super().commit(epoch)
+
+    async def abort(self, epoch: str) -> None:
+        self.calls.append(("abort", epoch))
+        if self.abort_always or self.abort_failures:
+            if self.abort_failures:
+                self.abort_failures -= 1
+            raise RuntimeError("sensitive participant abort failure")
+        if self.active_epoch == epoch:
+            self.active_epoch = "epoch_old"
+
+
+class DurableCoordinatorStore:
+    def __init__(self, *, cancel_begin: bool = False, control_commit: str = "normal") -> None:
+        self.mode = "active"
+        self.active_epoch = "epoch_old"
+        self.pending_epoch: str | None = None
+        self.cancel_begin = cancel_begin
+        self.control_commit = control_commit
+        self.begin_calls = 0
+        self.finalize_calls: list[str] = []
+
+    async def begin(self, epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
+        self.begin_calls += 1
+        self.mode = "preparing"
+        self.pending_epoch = epoch
+        if self.cancel_begin:
+            self.cancel_begin = False
+            raise asyncio.CancelledError
+
+    async def commit(self, epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
+        if self.control_commit == "rolled_back":
+            self.control_commit = "normal"
+            raise asyncio.CancelledError
+        self.active_epoch = epoch
+        self.mode = "finalizing"
+        if self.control_commit == "committed":
+            self.control_commit = "normal"
+            raise asyncio.CancelledError
+
+    async def fail(self, epoch: str, phase: str) -> None:
+        if self.pending_epoch != epoch:
+            return
+        if phase == "pre_cutover" and self.active_epoch != epoch:
+            self.mode = "aborting"
+        elif phase == "cleanup" and self.active_epoch == epoch:
+            self.mode = "error"
+
+    async def finalize(self, epoch: str) -> None:
+        assert self.pending_epoch == epoch
+        assert self.active_epoch == epoch
+        self.finalize_calls.append(epoch)
+        self.pending_epoch = None
+        self.mode = "active"
+
+    async def pending_cleanup(self) -> str | None:
+        if (
+            self.mode in {"finalizing", "error"}
+            and self.pending_epoch is not None
+            and self.active_epoch == self.pending_epoch
+        ):
+            return self.pending_epoch
+        return None
+
+    async def finalize_abort(self, epoch: str) -> None:
+        assert self.mode == "aborting"
+        assert self.pending_epoch == epoch
+        assert self.active_epoch != epoch
+        self.pending_epoch = None
+        self.mode = "error"
+
+    async def pending_abort(self) -> str | None:
+        if (
+            self.mode in {"preparing", "aborting"}
+            and self.pending_epoch is not None
+            and self.active_epoch != self.pending_epoch
+        ):
+            return self.pending_epoch
+        return None
+
+
+def durable_coordinator(
+    participants: dict[str, Participant],
+    bundle: ScenarioBundle,
+    store: DurableCoordinatorStore,
+) -> ResetCoordinator:
+    return ResetCoordinator(
+        participants,
+        lambda _sid, _version: bundle,
+        store.begin,
+        store.commit,
+        store.fail,  # type: ignore[arg-type]
+        store.finalize,
+        store.pending_cleanup,
+        store.finalize_abort,
+        store.pending_abort,
+    )
+
+
+def one_participant_bundle() -> ScenarioBundle:
+    return ScenarioBundle(
+        scenario_id="platform-contracts",
+        version=1,
+        initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
+        payloads={"identity": {"schemaVersion": "1", "expectedCounts": {}}},
+    )
+
+
 @pytest.mark.asyncio
 async def test_reset_is_ordered_and_same_inputs_have_same_checksum() -> None:
     identity = Participant("identity")
@@ -133,6 +272,147 @@ async def test_failed_load_aborts_every_participant_and_marks_estate_unhealthy()
     assert identity.calls[-1][0] == "abort"
     assert crm.calls[-1][0] == "abort"
     assert coordinator.test_mode == "error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["begin", "prepare", "load", "participant_commit"])
+async def test_cancellation_completes_durable_pre_cutover_abort_before_propagating(
+    stage: str,
+) -> None:
+    store = DurableCoordinatorStore(cancel_begin=stage == "begin")
+    identity = InterruptibleParticipant(
+        "identity", cancel_on={"prepare": "prepare", "load": "load"}.get(stage)
+    )
+    participants: dict[str, Participant] = {"identity": identity}
+    bundle = one_participant_bundle()
+    crm: InterruptibleParticipant | None = None
+    if stage == "participant_commit":
+        crm = InterruptibleParticipant("crm", cancel_on="commit")
+        participants["crm"] = crm
+        bundle = ScenarioBundle(
+            scenario_id="platform-contracts",
+            version=1,
+            initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
+            payloads={
+                "identity": {"schemaVersion": "1", "expectedCounts": {}},
+                "crm": {"schemaVersion": "1", "expectedCounts": {}},
+            },
+        )
+    coordinator = durable_coordinator(
+        participants,
+        bundle,
+        store,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+
+    assert store.mode == "error"
+    assert store.pending_epoch is None
+    assert identity.active_epoch == "epoch_old"
+    assert [action for action, _epoch in identity.calls].count("abort") == 1
+    if crm is not None:
+        assert crm.active_epoch == "epoch_old"
+        assert [action for action, _epoch in crm.calls].count("abort") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("control_commit", "expected_active", "expected_finalizes", "expected_aborts"),
+    [
+        ("rolled_back", "epoch_old", 0, 1),
+        ("committed", "new", 1, 0),
+    ],
+)
+async def test_control_commit_cancellation_recovers_from_the_persisted_transaction_outcome(
+    control_commit: str,
+    expected_active: str,
+    expected_finalizes: int,
+    expected_aborts: int,
+) -> None:
+    store = DurableCoordinatorStore(control_commit=control_commit)
+    identity = InterruptibleParticipant("identity")
+    coordinator = durable_coordinator(
+        {"identity": identity},
+        one_participant_bundle(),
+        store,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+
+    if expected_active == "new":
+        assert store.active_epoch != "epoch_old"
+        assert identity.active_epoch == store.active_epoch
+    else:
+        assert store.active_epoch == identity.active_epoch == "epoch_old"
+    assert store.mode in {"active", "error"}
+    assert store.pending_epoch is None
+    assert len(store.finalize_calls) == expected_finalizes
+    assert [action for action, _epoch in identity.calls].count("abort") == expected_aborts
+
+
+@pytest.mark.asyncio
+async def test_abort_failure_is_retryable_and_next_reset_recovers_same_epoch_before_beginning() -> (
+    None
+):
+    store = DurableCoordinatorStore()
+    identity = InterruptibleParticipant("identity", fail_on="load", abort_failures=1)
+    coordinator = durable_coordinator(
+        {"identity": identity},
+        one_participant_bundle(),
+        store,
+    )
+    request = ResetRequest(scenarioId="platform-contracts", version=1)
+
+    with pytest.raises(ApiError) as failed:
+        await coordinator.reset(request)
+    failed_epoch = store.pending_epoch
+
+    assert failed.value.status_code == 503
+    assert failed.value.retryable is True
+    assert failed.value.details == {"phase": "abort"}
+    assert "sensitive" not in str(failed.value)
+    assert store.mode == "aborting"
+    assert failed_epoch is not None
+    identity.fail_on = None
+
+    result = await coordinator.reset(request)
+
+    assert result.scenario_epoch != failed_epoch
+    assert store.mode == "active"
+    assert store.pending_epoch is None
+    abort_calls = [call for call in identity.calls if call == ("abort", failed_epoch)]
+    assert len(abort_calls) == 2
+    recovered_abort_index = identity.calls.index(("abort", failed_epoch), 1)
+    new_prepare_index = identity.calls.index(("prepare", result.scenario_epoch))
+    assert recovered_abort_index < new_prepare_index
+
+
+@pytest.mark.asyncio
+async def test_repeated_abort_recovery_failure_retains_epoch_and_never_begins_again() -> None:
+    store = DurableCoordinatorStore()
+    identity = InterruptibleParticipant("identity", fail_on="load", abort_always=True)
+    coordinator = durable_coordinator(
+        {"identity": identity},
+        one_participant_bundle(),
+        store,
+    )
+    request = ResetRequest(scenarioId="platform-contracts", version=1)
+
+    with pytest.raises(ApiError) as first:
+        await coordinator.reset(request)
+    failed_epoch = store.pending_epoch
+    identity.fail_on = None
+    with pytest.raises(ApiError) as second:
+        await coordinator.reset(request)
+
+    assert first.value.details == second.value.details == {"phase": "abort"}
+    assert store.mode == "aborting"
+    assert store.pending_epoch == failed_epoch
+    assert failed_epoch is not None
+    assert store.begin_calls == 1
+    assert identity.calls.count(("abort", failed_epoch)) == 2
 
 
 @pytest.mark.asyncio
@@ -307,6 +587,12 @@ async def test_next_reset_recovers_persisted_cleanup_before_starting_new_epoch()
     async def pending() -> str | None:
         return pending_epoch
 
+    async def finalize_abort(_epoch: str) -> None:
+        return None
+
+    async def pending_abort() -> str | None:
+        return None
+
     coordinator = ResetCoordinator(
         {"identity": identity, "crm": crm},
         lambda _sid, _version: bundle,
@@ -315,6 +601,8 @@ async def test_next_reset_recovers_persisted_cleanup_before_starting_new_epoch()
         fail,  # type: ignore[arg-type]
         finalize,
         pending,
+        finalize_abort,
+        pending_abort,
     )
     request = ResetRequest(scenarioId="platform-contracts", version=1)
 
@@ -365,6 +653,12 @@ async def test_repeated_cleanup_recovery_failure_retains_epoch_and_does_not_begi
     async def pending() -> str | None:
         return pending_epoch
 
+    async def finalize_abort(_epoch: str) -> None:
+        return None
+
+    async def pending_abort() -> str | None:
+        return None
+
     coordinator = ResetCoordinator(
         {"identity": identity},
         lambda _sid, _version: bundle,
@@ -373,6 +667,8 @@ async def test_repeated_cleanup_recovery_failure_retains_epoch_and_does_not_begi
         fail,  # type: ignore[arg-type]
         finalize,
         pending,
+        finalize_abort,
+        pending_abort,
     )
     request = ResetRequest(scenarioId="platform-contracts", version=1)
 
@@ -412,6 +708,12 @@ async def test_cleanup_response_stays_retryable_when_failure_marker_cannot_be_up
     async def pending() -> str | None:
         return None
 
+    async def finalize_abort(_epoch: str) -> None:
+        return None
+
+    async def pending_abort() -> str | None:
+        return None
+
     coordinator = ResetCoordinator(
         {"identity": identity},
         lambda _sid, _version: bundle,
@@ -420,6 +722,8 @@ async def test_cleanup_response_stays_retryable_when_failure_marker_cannot_be_up
         fail,  # type: ignore[arg-type]
         finalize,
         pending,
+        finalize_abort,
+        pending_abort,
     )
 
     with pytest.raises(ApiError) as raised:

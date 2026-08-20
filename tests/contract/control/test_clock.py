@@ -458,6 +458,8 @@ async def test_clock_http_snapshot_holds_the_scenario_fence_and_binds_its_header
         store.fail,
         store.finalize,
         store.pending_cleanup,
+        store.finalize_abort,
+        store.pending_abort,
     )
     repository = ControlRepository(db)
     reset_finished = asyncio.Event()

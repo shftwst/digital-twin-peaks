@@ -2,6 +2,7 @@ from collections.abc import Awaitable
 
 import httpx
 
+from enterprise_twins.common.auth.credentials import validate_private_credential
 from enterprise_twins.common.events.contracts import (
     EventEnvelope,
     WebhookSubscriptionCreate,
@@ -59,7 +60,7 @@ class RelayClient:
     def __init__(self, base_url: str, source: str, token: str, client: httpx.AsyncClient) -> None:
         self.base_url = base_url.rstrip("/")
         self.source = source
-        self.headers = {"Authorization": f"Bearer {token}"}
+        self.headers = {"Authorization": f"Bearer {validate_private_credential(token)}"}
         self.client = client
 
     @staticmethod

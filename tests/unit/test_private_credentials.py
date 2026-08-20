@@ -2,14 +2,18 @@
 
 from collections.abc import Callable
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
 from enterprise_twins.common.auth.claims import Principal
 from enterprise_twins.common.auth.verifier import BearerAuthenticator
 from enterprise_twins.common.control.auth import require_token
+from enterprise_twins.common.control.client import ControlClient
+from enterprise_twins.common.events.relay_client import RelayClient
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.conformance.receiver import create_receiver_app
+from enterprise_twins.services.control.reset import HttpParticipantClient
 from enterprise_twins.services.control.settings import ControlSettings
 from enterprise_twins.services.crm.settings import CrmSettings
 from enterprise_twins.services.identity.settings import IdentitySettings
@@ -116,6 +120,23 @@ def test_conformance_receiver_rejects_invalid_control_token_during_construction(
 ) -> None:
     with pytest.raises(ValueError, match="credential"):
         create_receiver_app(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", ["", " \t", "embedded whitespace"])
+@pytest.mark.parametrize("client_type", ["control", "relay", "participant"])
+async def test_direct_private_clients_reject_invalid_tokens_during_construction(
+    client_type: str,
+    token: str,
+) -> None:
+    async with httpx.AsyncClient() as http_client:
+        with pytest.raises(ValueError, match="credential"):
+            if client_type == "control":
+                ControlClient("http://control", token, http_client)
+            elif client_type == "relay":
+                RelayClient("http://relay", "crm", token, http_client)
+            else:
+                HttpParticipantClient("http://identity-admin", token, http_client)
 
 
 def test_private_token_dependency_accepts_only_an_exact_bearer_header() -> None:

@@ -60,19 +60,26 @@ async def bootstrap_scenario(
     except ScenarioStateMissingError:
         state = None
     if state is not None:
-        recovery_required = (
+        cleanup_recovery_required = (
             state.mode in {"finalizing", "error"}
             and state.pending_epoch is not None
             and state.active_epoch == state.pending_epoch
         )
-        if not recovery_required:
+        abort_recovery_required = (
+            state.mode in {"preparing", "aborting"}
+            and state.pending_epoch is not None
+            and state.active_epoch != state.pending_epoch
+        )
+        if not cleanup_recovery_required and not abort_recovery_required:
             return
+    else:
+        abort_recovery_required = False
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
     while True:
         try:
-            if state is None:
+            if state is None or abort_recovery_required:
                 await coordinator.reset(request)
             else:
                 await coordinator.recover_pending_cleanup()
@@ -80,7 +87,7 @@ async def bootstrap_scenario(
         except (ApiError, httpx.TransportError) as error:
             if isinstance(error, ApiError) and not (
                 error.code == ErrorCode.TEMPORARILY_UNAVAILABLE
-                and error.details.get("phase") == "cleanup"
+                and error.details.get("phase") in {"cleanup", "abort"}
             ):
                 raise
             remaining = deadline - loop.time()
@@ -141,6 +148,8 @@ def create_from_env() -> FastAPI:
         store.fail,
         store.finalize,
         store.pending_cleanup,
+        store.finalize_abort,
+        store.pending_abort,
     )
 
     @asynccontextmanager

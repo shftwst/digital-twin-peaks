@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, Response
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from enterprise_twins.common.auth.credentials import validate_private_credential
 from enterprise_twins.common.canonical import sha256_hex
 from enterprise_twins.common.control.auth import require_token
 from enterprise_twins.common.control.contracts import (
@@ -91,11 +92,17 @@ BeginControl = Callable[[str, ScenarioBundle, int], Awaitable[None]]
 CommitControl = Callable[[str, ScenarioBundle, int], Awaitable[None]]
 FinalizeControl = Callable[[str], Awaitable[None]]
 PendingCleanup = Callable[[], Awaitable[str | None]]
+FinalizeAbortControl = Callable[[str], Awaitable[None]]
+PendingAbort = Callable[[], Awaitable[str | None]]
 ResetFailurePhase = Literal["pre_cutover", "cleanup"]
 FailControl = Callable[[str, ResetFailurePhase], Awaitable[None]]
 
 
 class ResetCleanupError(RuntimeError):
+    pass
+
+
+class ResetAbortError(RuntimeError):
     pass
 
 
@@ -109,6 +116,8 @@ class ResetCoordinator:
         fail_control: FailControl,
         finalize_control: FinalizeControl,
         pending_cleanup: PendingCleanup,
+        finalize_abort_control: FinalizeAbortControl,
+        pending_abort: PendingAbort,
     ) -> None:
         self.participants = participants
         self.load_bundle = load_bundle
@@ -117,6 +126,8 @@ class ResetCoordinator:
         self.fail_control = fail_control
         self.finalize_control = finalize_control
         self.pending_cleanup = pending_cleanup
+        self.finalize_abort_control = finalize_abort_control
+        self.pending_abort = pending_abort
         self.lock = asyncio.Lock()
         self.test_mode = "active"
 
@@ -124,19 +135,57 @@ class ResetCoordinator:
     def for_test(
         cls, participants: dict[str, ParticipantClient], bundle: ScenarioBundle
     ) -> ResetCoordinator:
-        async def begin(_epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
+        active_epoch = "none"
+        pending_epoch: str | None = None
+        mode = "active"
+
+        async def begin(epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
+            nonlocal mode, pending_epoch
+            mode = "preparing"
+            pending_epoch = epoch
+
+        async def commit(epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
+            nonlocal active_epoch, mode
+            active_epoch = epoch
+            mode = "finalizing"
+
+        async def fail(epoch: str, phase: ResetFailurePhase) -> None:
+            nonlocal mode
+            if pending_epoch != epoch:
+                return
+            if phase == "pre_cutover" and active_epoch != epoch:
+                mode = "aborting"
+            elif phase == "cleanup" and active_epoch == epoch:
+                mode = "error"
+
+        async def finalize(epoch: str) -> None:
+            nonlocal mode, pending_epoch
+            if pending_epoch == epoch and active_epoch == epoch:
+                pending_epoch = None
+                mode = "active"
+
+        async def pending_cleanup() -> str | None:
+            if (
+                pending_epoch is not None
+                and pending_epoch == active_epoch
+                and mode in {"finalizing", "error"}
+            ):
+                return pending_epoch
             return None
 
-        async def commit(_epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
-            return None
+        async def finalize_abort(epoch: str) -> None:
+            nonlocal mode, pending_epoch
+            if pending_epoch == epoch and active_epoch != epoch:
+                pending_epoch = None
+                mode = "error"
 
-        async def fail(_epoch: str, _phase: ResetFailurePhase) -> None:
-            return None
-
-        async def finalize(_epoch: str) -> None:
-            return None
-
-        async def pending() -> str | None:
+        async def pending_abort() -> str | None:
+            if (
+                pending_epoch is not None
+                and pending_epoch != active_epoch
+                and mode in {"preparing", "aborting"}
+            ):
+                return pending_epoch
             return None
 
         return cls(
@@ -146,7 +195,9 @@ class ResetCoordinator:
             commit,
             fail,
             finalize,
-            pending,
+            pending_cleanup,
+            finalize_abort,
+            pending_abort,
         )
 
     @staticmethod
@@ -157,6 +208,16 @@ class ResetCoordinator:
             status_code=503,
             retryable=True,
             details={"phase": "cleanup"},
+        )
+
+    @staticmethod
+    def abort_unavailable() -> ApiError:
+        return ApiError(
+            ErrorCode.TEMPORARILY_UNAVAILABLE,
+            "reset abort recovery is temporarily unavailable",
+            status_code=503,
+            retryable=True,
+            details={"phase": "abort"},
         )
 
     async def finalize_epoch(self, epoch: str) -> None:
@@ -191,9 +252,70 @@ class ResetCoordinator:
         async with self.lock:
             return await self.recover_pending_cleanup_unlocked()
 
+    async def abort_epoch(self, epoch: str) -> None:
+        abort_results = await asyncio.gather(
+            *(participant.abort(epoch) for participant in self.participants.values()),
+            return_exceptions=True,
+        )
+        if any(isinstance(result, BaseException) for result in abort_results):
+            raise ResetAbortError("participant reset abort failed")
+        await self.finalize_abort_control(epoch)
+
+    async def recover_pending_abort_unlocked(self) -> bool:
+        epoch = await self.pending_abort()
+        if epoch is None:
+            return False
+        try:
+            await self.fail_control(epoch, "pre_cutover")
+            await self.abort_epoch(epoch)
+        except Exception:
+            self.test_mode = "abort_error"
+            raise self.abort_unavailable() from None
+        self.test_mode = "error"
+        return True
+
+    async def recover_interrupted_epoch(self, epoch: str) -> None:
+        cleanup_epoch = await self.pending_cleanup()
+        if cleanup_epoch == epoch:
+            try:
+                await self.finalize_epoch(epoch)
+            except Exception:
+                await self.mark_cleanup_failed(epoch)
+                self.test_mode = "cleanup_error"
+                raise self.cleanup_unavailable() from None
+            self.test_mode = "active"
+            return
+
+        try:
+            await self.fail_control(epoch, "pre_cutover")
+            abort_epoch = await self.pending_abort()
+            if abort_epoch is None:
+                self.test_mode = "error"
+                return
+            if abort_epoch != epoch:
+                raise ResetAbortError("pending reset abort epoch differs")
+            await self.abort_epoch(epoch)
+        except Exception:
+            self.test_mode = "abort_error"
+            raise self.abort_unavailable() from None
+        self.test_mode = "error"
+
+    async def compensate_cancellation(self, epoch: str) -> None:
+        task = asyncio.create_task(self.recover_interrupted_epoch(epoch))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            except Exception:
+                return
+        except Exception:
+            return
+
     async def reset(self, request: ResetRequest) -> ResetResult:
         async with self.lock:
             await self.recover_pending_cleanup_unlocked()
+            await self.recover_pending_abort_unlocked()
             bundle = self.load_bundle(request.scenario_id, request.version)
             if set(self.participants) != set(bundle.payloads):
                 raise ValueError("participant services differ from scenario bundle services")
@@ -205,8 +327,8 @@ class ResetCoordinator:
             manifest_checksum = bundle.checksum(seed)
             epoch = new_id("epoch")
             reports: list[ParticipantReport] = []
-            await self.begin_control(epoch, bundle, seed)
             try:
+                await self.begin_control(epoch, bundle, seed)
                 for participant in self.participants.values():
                     await participant.prepare(epoch)
                 for name, participant in self.participants.items():
@@ -237,13 +359,11 @@ class ResetCoordinator:
                 for participant in self.participants.values():
                     await participant.commit(epoch)
                 await self.commit_control(epoch, bundle, seed)
+            except asyncio.CancelledError:
+                await self.compensate_cancellation(epoch)
+                raise
             except Exception:
-                await asyncio.gather(
-                    *(participant.abort(epoch) for participant in self.participants.values()),
-                    return_exceptions=True,
-                )
-                await self.fail_control(epoch, "pre_cutover")
-                self.test_mode = "error"
+                await self.recover_interrupted_epoch(epoch)
                 raise
             try:
                 await self.finalize_epoch(epoch)
@@ -270,7 +390,7 @@ def derive_seed(scenario_id: str, version: int) -> int:
 class HttpParticipantClient:
     def __init__(self, base_url: str, token: str, client: httpx.AsyncClient) -> None:
         self.base_url = base_url.rstrip("/")
-        self.headers = {"Authorization": f"Bearer {token}"}
+        self.headers = {"Authorization": f"Bearer {validate_private_credential(token)}"}
         self.client = client
 
     async def post(self, action: str, body: dict[str, object]) -> httpx.Response:
@@ -449,22 +569,61 @@ class ControlResetStore:
             return state.pending_epoch
         return None
 
+    async def pending_abort(self) -> str | None:
+        async with self.factory() as session:
+            state = await session.get(ScenarioState, 1)
+        if (
+            state is not None
+            and state.mode in {"preparing", "aborting"}
+            and state.pending_epoch is not None
+            and state.active_epoch != state.pending_epoch
+        ):
+            return state.pending_epoch
+        return None
+
     async def fail(self, epoch: str, phase: ResetFailurePhase) -> None:
         async with self.factory.begin() as session:
             state = await session.get(ScenarioState, 1, with_for_update=True)
-            if state is not None and state.pending_epoch == epoch:
-                state.mode = "error"
-                if phase == "pre_cutover":
-                    state.pending_epoch = None
-                    self.clear_pending_metadata(state)
             run = await session.scalar(select(ResetRun).where(ResetRun.scenario_epoch == epoch))
-            if run is not None:
+            if state is None or state.pending_epoch != epoch:
+                return
+            if phase == "pre_cutover" and state.active_epoch != epoch:
+                state.mode = "aborting"
+                if run is not None:
+                    run.state = "aborting"
+                    run.error = "participant reset abort pending"
+                return
+            if phase == "cleanup" and state.active_epoch == epoch:
+                state.mode = "error"
+                if run is not None:
+                    run.state = "failed"
+                    run.error = "participant reset cleanup failed"
+
+    async def finalize_abort(self, epoch: str) -> None:
+        async with self.factory.begin() as session:
+            state = await session.get(ScenarioState, 1, with_for_update=True)
+            run = await session.scalar(select(ResetRun).where(ResetRun.scenario_epoch == epoch))
+            if (
+                state is not None
+                and state.pending_epoch == epoch
+                and state.active_epoch != epoch
+                and state.mode == "aborting"
+            ):
+                state.pending_epoch = None
+                self.clear_pending_metadata(state)
+                state.mode = "error"
+                if run is None:
+                    raise RuntimeError("control reset run is missing")
                 run.state = "failed"
-                run.error = (
-                    "participant reset failed before cutover"
-                    if phase == "pre_cutover"
-                    else "participant reset cleanup failed"
-                )
+                run.error = "participant reset failed before cutover"
+                return
+            if (
+                run is not None
+                and run.state == "failed"
+                and (state is None or state.pending_epoch != epoch)
+            ):
+                return
+            raise RuntimeError("control reset is not ready to finalize abort")
 
     @staticmethod
     def clear_pending_metadata(state: ScenarioState) -> None:
@@ -518,9 +677,17 @@ def reset_router(
             "mode": state.mode,
             "pendingEpoch": state.pending_epoch,
             "recoveryRequired": (
-                state.mode in {"finalizing", "error"}
-                and state.pending_epoch is not None
-                and state.active_epoch == state.pending_epoch
+                state.pending_epoch is not None
+                and (
+                    (
+                        state.mode in {"finalizing", "error"}
+                        and state.active_epoch == state.pending_epoch
+                    )
+                    or (
+                        state.mode in {"preparing", "aborting"}
+                        and state.active_epoch != state.pending_epoch
+                    )
+                )
             ),
             "now": now,
         }

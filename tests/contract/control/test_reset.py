@@ -24,6 +24,7 @@ from enterprise_twins.services.control.app import (
     create_from_env,
 )
 from enterprise_twins.services.control.models import ResetRun, VirtualClock
+from enterprise_twins.services.control.repository import ControlRepository
 from enterprise_twins.services.control.reset import (
     ControlResetStore,
     DirectoryBundleLoader,
@@ -238,6 +239,8 @@ async def test_control_reset_and_status_routes_require_controller_role(
         store.fail,
         store.finalize,
         store.pending_cleanup,
+        store.finalize_abort,
+        store.pending_abort,
     )
     settings = ControlSettings(
         database_url="postgresql+asyncpg://unused",
@@ -320,6 +323,23 @@ async def test_store_failure_records_pre_cutover_and_cleanup_distinctly(
     bundle = empty_bundle()
     await store.begin("epoch_pre", bundle, 7)
     await store.fail("epoch_pre", "pre_cutover")
+    async with db() as session:
+        aborting = await session.get(ScenarioState, 1)
+        aborting_run = await session.scalar(
+            select(ResetRun).where(ResetRun.scenario_epoch == "epoch_pre")
+        )
+    assert aborting is not None
+    assert aborting.mode == "aborting"
+    assert aborting.pending_epoch == "epoch_pre"
+    assert aborting.pending_scenario_id == "platform-contracts"
+    assert aborting_run is not None
+    assert aborting_run.state == "aborting"
+    assert await store.pending_abort() == "epoch_pre"
+    with pytest.raises(ApiError, match="another reset is active"):
+        await store.begin("epoch_replacement", bundle, 7)
+
+    await store.finalize_abort("epoch_pre")
+    assert await store.pending_abort() is None
     await store.begin("epoch_cleanup", bundle, 7)
     await store.commit("epoch_cleanup", bundle, 7)
     await store.fail("epoch_cleanup", "cleanup")
@@ -330,6 +350,7 @@ async def test_store_failure_records_pre_cutover_and_cleanup_distinctly(
             for run in await session.scalars(select(ResetRun).order_by(ResetRun.scenario_epoch))
         }
         state = await session.get(ScenarioState, 1)
+    assert runs["epoch_pre"].state == "failed"
     assert runs["epoch_pre"].error == "participant reset failed before cutover"
     assert runs["epoch_cleanup"].error == "participant reset cleanup failed"
     assert state is not None
@@ -338,8 +359,6 @@ async def test_store_failure_records_pre_cutover_and_cleanup_distinctly(
     assert state.pending_epoch == "epoch_cleanup"
     assert await store.pending_cleanup() == "epoch_cleanup"
 
-    with pytest.raises(ApiError, match="another reset is active"):
-        await store.begin("epoch_replacement", bundle, 7)
     await store.finalize("epoch_cleanup")
     await store.finalize("epoch_cleanup")
 
@@ -355,6 +374,47 @@ async def test_store_failure_records_pre_cutover_and_cleanup_distinctly(
     assert cleanup_run.state == "committed"
     assert cleanup_run.error is None
     assert await store.pending_cleanup() is None
+
+
+@pytest.mark.asyncio
+async def test_preparing_reset_status_reports_persisted_recovery_requirement(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    await initialise_control(db)
+    store = ControlResetStore(db)
+    bundle = empty_bundle()
+    await store.begin("epoch_abandoned", bundle, 7)
+    coordinator = ResetCoordinator(
+        {},
+        lambda _scenario_id, _version: bundle,
+        store.begin,
+        store.commit,
+        store.fail,
+        store.finalize,
+        store.pending_cleanup,
+        store.finalize_abort,
+        store.pending_abort,
+    )
+    app = build_control_app(
+        db,
+        ControlSettings(
+            database_url="postgresql+asyncpg://unused",
+            controller_token="controller-token",  # noqa: S106
+            twin_token="twin-token",  # noqa: S106
+        ),
+        coordinator,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://control") as client:
+        response = await client.get(
+            "/control/v1/status",
+            headers={"Authorization": "Bearer controller-token"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "preparing"
+    assert response.json()["pendingEpoch"] == "epoch_abandoned"
+    assert response.json()["recoveryRequired"] is True
 
 
 def test_reset_request_boundary_still_rejects_unpersistable_seed() -> None:
@@ -437,6 +497,8 @@ async def test_reset_catalogue_errors_use_common_redacted_envelopes_without_stat
         store.fail,
         store.finalize,
         store.pending_cleanup,
+        store.finalize_abort,
+        store.pending_abort,
     )
     app = build_control_app(
         db,
@@ -491,6 +553,8 @@ async def test_reset_invalid_scenario_id_is_a_common_422_without_state_change(
         store.fail,
         store.finalize,
         store.pending_cleanup,
+        store.finalize_abort,
+        store.pending_abort,
     )
     app = build_control_app(
         db,
@@ -546,6 +610,191 @@ class CleanupParticipant:
         raise AssertionError("post-cutover cleanup must not abort")
 
 
+class AbortRecoveryParticipant:
+    def __init__(
+        self,
+        *,
+        fail_load_once: bool = False,
+        abort_failures: int = 0,
+    ) -> None:
+        self.mode = "error"
+        self.active_epoch = "epoch_old"
+        self.pending_epoch: str | None = None
+        self.rollback_epoch: str | None = None
+        self.fail_load_once = fail_load_once
+        self.abort_failures = abort_failures
+        self.abort_calls: list[str] = []
+
+    async def prepare(self, epoch: str) -> None:
+        self.mode = "preparing"
+        self.pending_epoch = epoch
+
+    async def load(self, request: ParticipantLoadRequest) -> ParticipantReport:
+        if self.fail_load_once:
+            self.fail_load_once = False
+            raise RuntimeError("sensitive participant load failure")
+        self.mode = "loaded"
+        return ParticipantReport(
+            service="identity",
+            schemaVersion=request.payload["schemaVersion"],
+            counts=request.payload["expectedCounts"],
+            aliases=request.payload.get("aliases", {}),
+            checksum=request.checksum,
+        )
+
+    async def commit(self, epoch: str) -> None:
+        assert self.pending_epoch == epoch
+        self.rollback_epoch = self.active_epoch
+        self.active_epoch = epoch
+        self.mode = "committed"
+
+    async def finalize(self, epoch: str) -> None:
+        assert self.active_epoch == epoch
+        self.pending_epoch = None
+        self.rollback_epoch = None
+        self.mode = "active"
+
+    async def abort(self, epoch: str) -> None:
+        self.abort_calls.append(epoch)
+        if self.abort_failures:
+            self.abort_failures -= 1
+            raise RuntimeError("sensitive participant abort failure")
+        if self.active_epoch == epoch and self.rollback_epoch is not None:
+            self.active_epoch = self.rollback_epoch
+        if self.pending_epoch == epoch:
+            self.pending_epoch = None
+        self.rollback_epoch = None
+        self.mode = "error"
+
+    @property
+    def ready(self) -> bool:
+        return self.mode == "active" and self.pending_epoch is None
+
+
+def participant_bundle() -> ScenarioBundle:
+    return ScenarioBundle(
+        scenario_id="platform-contracts",
+        version=1,
+        initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
+        payloads={"identity": {"schemaVersion": "1", "expectedCounts": {}, "aliases": {}}},
+    )
+
+
+def coordinator_with_store(
+    store: ControlResetStore,
+    participant: AbortRecoveryParticipant,
+    bundle: ScenarioBundle,
+) -> ResetCoordinator:
+    return ResetCoordinator(
+        {"identity": participant},
+        lambda _scenario_id, _version: bundle,
+        store.begin,
+        store.commit,
+        store.fail,
+        store.finalize,
+        store.pending_cleanup,
+        store.finalize_abort,
+        store.pending_abort,
+    )
+
+
+@pytest.mark.asyncio
+async def test_abort_failure_returns_503_and_next_reset_recovers_before_new_epoch(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    await initialise_control(db)
+    store = ControlResetStore(db)
+    participant = AbortRecoveryParticipant(fail_load_once=True, abort_failures=1)
+    bundle = participant_bundle()
+    coordinator = coordinator_with_store(store, participant, bundle)
+    app = build_control_app(
+        db,
+        ControlSettings(
+            database_url="postgresql+asyncpg://unused",
+            controller_token="controller-token",  # noqa: S106
+            twin_token="twin-token",  # noqa: S106
+        ),
+        coordinator,
+    )
+    headers = {"Authorization": "Bearer controller-token"}
+    body = {"scenarioId": "platform-contracts", "version": 1}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://control") as client:
+        failed = await client.post("/control/v1/reset", headers=headers, json=body)
+        pending = await client.get("/control/v1/status", headers=headers)
+        unhealthy = await client.get("/health/ready")
+        recovered = await client.post("/control/v1/reset", headers=headers, json=body)
+        active = await client.get("/control/v1/status", headers=headers)
+        healthy = await client.get("/health/ready")
+
+    assert failed.status_code == 503
+    assert failed.json()["error"] == {
+        "code": "temporarily_unavailable",
+        "message": "reset abort recovery is temporarily unavailable",
+        "retryable": True,
+        "requestId": failed.headers["X-Request-Id"],
+        "details": {"phase": "abort"},
+    }
+    assert "sensitive" not in failed.text
+    failed_epoch = pending.json()["pendingEpoch"]
+    assert pending.json()["mode"] == "aborting"
+    assert pending.json()["scenarioEpoch"] == "epoch_old"
+    assert pending.json()["recoveryRequired"] is True
+    assert failed_epoch is not None
+    assert unhealthy.status_code == 503
+    assert recovered.status_code == 200
+    recovered_epoch = recovered.json()["scenarioEpoch"]
+    assert recovered_epoch != failed_epoch
+    assert participant.abort_calls.count(failed_epoch) == 2
+    assert participant.ready is True
+    assert participant.active_epoch == recovered_epoch
+    assert active.json()["mode"] == "active"
+    assert active.json()["pendingEpoch"] is None
+    assert active.json()["recoveryRequired"] is False
+    assert healthy.status_code == 200
+    async with db() as session:
+        runs = {
+            item.scenario_epoch: item.state
+            for item in await session.scalars(select(ResetRun).order_by(ResetRun.scenario_epoch))
+        }
+    assert runs == {failed_epoch: "failed", recovered_epoch: "committed"}
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_recovers_pending_abort_then_reseeds_every_participant(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    await initialise_control(db)
+    store = ControlResetStore(db)
+    bundle = participant_bundle()
+    await store.begin("epoch_abandoned", bundle, 7)
+    await store.fail("epoch_abandoned", "pre_cutover")
+    participant = AbortRecoveryParticipant()
+    participant.mode = "preparing"
+    participant.pending_epoch = "epoch_abandoned"
+    coordinator = coordinator_with_store(store, participant, bundle)
+
+    await bootstrap_scenario(
+        ControlRepository(db),
+        coordinator,
+        ResetRequest(scenarioId="platform-contracts", version=1),
+        timeout_seconds=1.0,
+        retry_delay_seconds=0.0,
+    )
+
+    async with db() as session:
+        state = await session.get(ScenarioState, 1)
+        runs = list(await session.scalars(select(ResetRun).order_by(ResetRun.reset_id)))
+    assert state is not None
+    assert state.mode == "active"
+    assert state.pending_epoch is None
+    assert state.active_epoch not in {"epoch_old", "epoch_abandoned"}
+    assert participant.abort_calls == ["epoch_abandoned"]
+    assert participant.ready is True
+    assert participant.active_epoch == state.active_epoch
+    assert sorted(run.state for run in runs) == ["committed", "failed"]
+
+
 @pytest.mark.asyncio
 async def test_cleanup_failure_returns_503_then_next_reset_recovers_before_new_reset(
     db: async_sessionmaker[AsyncSession],
@@ -566,6 +815,8 @@ async def test_cleanup_failure_returns_503_then_next_reset_recovers_before_new_r
         store.fail,
         store.finalize,
         store.pending_cleanup,
+        store.finalize_abort,
+        store.pending_abort,
     )
     app = build_control_app(
         db,

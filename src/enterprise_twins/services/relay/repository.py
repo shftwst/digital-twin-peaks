@@ -42,14 +42,27 @@ class RelayRepository:
         self.factory = factory
         self.allowed_targets = allowed_targets
 
-    async def active_epoch(self, session: AsyncSession) -> str:
+    async def active_epoch(
+        self,
+        session: AsyncSession,
+        expected_epoch: str | None = None,
+    ) -> str:
         state = await session.scalar(
             select(ScenarioState).where(ScenarioState.singleton_id == 1).with_for_update(read=True)
         )
         if state is not None:
             bind_response_epoch(state.active_epoch)
-        if state is None or state.mode != "active":
-            raise RuntimeError("relay scenario is not active")
+        if (
+            state is None
+            or state.mode != "active"
+            or (expected_epoch is not None and state.active_epoch != expected_epoch)
+        ):
+            raise ApiError(
+                ErrorCode.TEMPORARILY_UNAVAILABLE,
+                "Relay scenario is not active",
+                status_code=503,
+                retryable=True,
+            )
         return state.active_epoch
 
     async def create_subscription(
@@ -59,12 +72,13 @@ class RelayRepository:
         idempotency_key: str,
         request: WebhookSubscriptionCreate,
         now: datetime,
+        expected_epoch: str | None = None,
     ) -> WebhookSubscriptionCreated:
         host = request.target_url.host
         if host not in self.allowed_targets:
             raise ValueError("target host is not allowed")
         async with self.factory.begin() as session:
-            epoch = await self.active_epoch(session)
+            epoch = await self.active_epoch(session, expected_epoch)
             namespace = IdempotencyNamespace(
                 "tenant_synthetic",
                 caller_id,
@@ -108,11 +122,11 @@ class RelayRepository:
             )
             return WebhookSubscriptionCreated.model_validate(result.body)
 
-    async def ingest(self, event: EventEnvelope) -> bool:
+    async def ingest(self, event: EventEnvelope, expected_epoch: str | None = None) -> bool:
         body = event.model_dump(mode="json", by_alias=True)
         digest = sha256_hex(body)
         async with self.factory.begin() as session:
-            epoch = await self.active_epoch(session)
+            epoch = await self.active_epoch(session, expected_epoch)
             inserted = await session.scalar(
                 insert(SourceEvent)
                 .values(
@@ -159,9 +173,13 @@ class RelayRepository:
                 )
             return True
 
-    async def list_subscriptions(self, source: str) -> list[WebhookSubscriptionView]:
+    async def list_subscriptions(
+        self,
+        source: str,
+        expected_epoch: str | None = None,
+    ) -> list[WebhookSubscriptionView]:
         async with self.factory() as session:
-            epoch = await self.active_epoch(session)
+            epoch = await self.active_epoch(session, expected_epoch)
             rows = await session.scalars(
                 select(Subscription)
                 .where(
@@ -189,9 +207,10 @@ class RelayRepository:
         idempotency_key: str,
         subscription_id: str,
         expected_version: int,
+        expected_epoch: str | None = None,
     ) -> None:
         async with self.factory.begin() as session:
-            epoch = await self.active_epoch(session)
+            epoch = await self.active_epoch(session, expected_epoch)
             namespace = IdempotencyNamespace(
                 "tenant_synthetic",
                 caller_id,

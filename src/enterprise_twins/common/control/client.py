@@ -2,6 +2,7 @@ from datetime import datetime
 
 import httpx
 
+from enterprise_twins.common.auth.credentials import validate_private_credential
 from enterprise_twins.common.control.contracts import ClockValue, FaultDecision, FaultProbe
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 
@@ -9,7 +10,7 @@ from enterprise_twins.common.http.errors import ApiError, ErrorCode
 class ControlClient:
     def __init__(self, base_url: str, token: str, client: httpx.AsyncClient) -> None:
         self.base_url = base_url.rstrip("/")
-        self.token = token
+        self.token = validate_private_credential(token)
         self.client = client
 
     @staticmethod

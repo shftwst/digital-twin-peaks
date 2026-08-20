@@ -46,12 +46,14 @@ def relay_router(
     ) -> WebhookSubscriptionCreated:
         authorise(source, authorization)
         try:
+            snapshot = await control.snapshot()
             return await repository.create_subscription(
                 source,
                 caller_id,
                 idempotency_key,
                 body,
-                await control.now(),
+                snapshot.now,
+                snapshot.scenario_epoch,
             )
         except ValueError as error:
             raise ApiError(ErrorCode.INVALID_REQUEST, str(error), status_code=422) from error
@@ -62,7 +64,8 @@ def relay_router(
         authorization: Annotated[str | None, Header()] = None,
     ) -> list[WebhookSubscriptionView]:
         authorise(source, authorization)
-        return await repository.list_subscriptions(source)
+        snapshot = await control.snapshot()
+        return await repository.list_subscriptions(source, snapshot.scenario_epoch)
 
     @router.delete("/sources/{source}/subscriptions/{subscription_id}", status_code=204)
     async def delete_subscription(
@@ -77,12 +80,14 @@ def relay_router(
     ) -> None:
         authorise(source, authorization)
         expected_version = parse_quoted_version(if_match, minimum=1)
+        snapshot = await control.snapshot()
         await repository.delete_subscription(
             source,
             caller_id,
             idempotency_key,
             subscription_id,
             expected_version,
+            snapshot.scenario_epoch,
         )
 
     @router.post("/events", status_code=202)
@@ -91,6 +96,7 @@ def relay_router(
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, bool]:
         authorise(event.source, authorization)
-        return {"accepted": await repository.ingest(event)}
+        snapshot = await control.snapshot()
+        return {"accepted": await repository.ingest(event, snapshot.scenario_epoch)}
 
     return router
