@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from enterprise_twins.common.auth.claims import Principal
 from enterprise_twins.common.auth.verifier import BearerAuthenticator, JwtVerifier
+from enterprise_twins.common.control.contracts import ClockValue
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 
 NOW = datetime(2026, 8, 19, 10, tzinfo=UTC)
@@ -23,6 +24,9 @@ class Clock:
 
     async def now(self) -> datetime:
         return self.value
+
+    async def snapshot(self) -> ClockValue:
+        return ClockValue(now=self.value, scenarioEpoch=self.epoch)
 
     async def current_epoch(self) -> str:
         return self.epoch
@@ -230,6 +234,33 @@ async def test_old_epoch_token_fails_after_clock_epoch_changes() -> None:
             await verifier.verify(encoded)
 
     assert raised.value.code == ErrorCode.UNAUTHENTICATED
+
+
+@pytest.mark.asyncio
+async def test_verifier_uses_one_atomic_clock_and_epoch_snapshot() -> None:
+    private_key, public_jwk = signing_material()
+
+    class SplitClock(Clock):
+        async def snapshot(self) -> ClockValue:
+            return ClockValue(now=NOW, scenarioEpoch="epoch_1")
+
+        async def current_epoch(self) -> str:
+            return "epoch_after_reset"
+
+    async def jwks(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"keys": [public_jwk]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(jwks)) as client:
+        verifier = JwtVerifier(
+            "http://identity:8000",
+            "enterprise-twins",
+            "http://identity:8000/.well-known/jwks.json",
+            SplitClock(),
+            client,
+        )
+        principal = await verifier.verify(token(private_key))
+
+    assert principal.scenario_epoch == "epoch_1"
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp
 
 from enterprise_twins.common.auth.verifier import JwtVerifier
-from enterprise_twins.common.control.contracts import FaultDecision, FaultProbe
+from enterprise_twins.common.control.contracts import ClockValue, FaultDecision, FaultProbe
 from enterprise_twins.common.db.records import ScenarioState
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.crm.app import create_crm_app
@@ -42,6 +42,10 @@ class Control:
     async def now(self) -> datetime:
         self.require_available()
         return NOW
+
+    async def snapshot(self) -> ClockValue:
+        self.require_available()
+        return ClockValue(now=NOW, scenarioEpoch=self.epoch)
 
     async def current_epoch(self) -> str:
         self.require_available()

@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_twins.common.control.contracts import (
+    ClockValue,
     FaultDecision,
     FaultEffect,
     FaultPhase,
@@ -13,7 +14,7 @@ from enterprise_twins.common.control.contracts import (
 )
 from enterprise_twins.common.db.records import ScenarioState
 from enterprise_twins.common.events.publisher import record_audit, record_event
-from enterprise_twins.common.http.context import current_request
+from enterprise_twins.common.http.context import bind_response_epoch, current_request
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.common.ids import new_id
 from enterprise_twins.services.identity.issuer import TokenIssuer
@@ -23,6 +24,9 @@ from enterprise_twins.services.identity.settings import IdentitySettings
 
 
 class IdentityControl(Protocol):
+    async def snapshot(self) -> ClockValue:
+        raise NotImplementedError
+
     async def now(self) -> datetime:
         raise NotImplementedError
 
@@ -110,14 +114,17 @@ class IdentityRepository:
                 status_code=503,
                 retryable=True,
             )
-        now = await self.control.now()
-        epoch = await self.control.current_epoch()
+        snapshot = await self.control.snapshot()
+        now = snapshot.now
+        epoch = snapshot.scenario_epoch
         async with self.factory.begin() as session:
             state = await session.scalar(
                 select(ScenarioState)
                 .where(ScenarioState.singleton_id == 1)
                 .with_for_update(read=True)
             )
+            if state is not None:
+                bind_response_epoch(state.active_epoch)
             if state is None or state.mode != "active" or state.active_epoch != epoch:
                 raise ApiError(
                     ErrorCode.TEMPORARILY_UNAVAILABLE,

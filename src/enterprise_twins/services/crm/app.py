@@ -8,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_twins.common.auth.audit import DatabaseAuthDecisionRecorder
+from enterprise_twins.common.auth.scenario import ScenarioAccess
 from enterprise_twins.common.auth.verifier import BearerAuthenticator, JwtVerifier
 from enterprise_twins.common.control.client import ControlClient
 from enterprise_twins.common.db.records import ScenarioState
@@ -83,7 +84,15 @@ def create_crm_app(
         "CRM twin",
         ("crm:read", "crm:notes:write", "webhooks:manage"),
         CrmStatus(factory, control),
-        (crm_router(repository, service, authenticator, relay),),
+        (
+            crm_router(
+                repository,
+                service,
+                authenticator,
+                relay,
+                ScenarioAccess("CRM", factory),
+            ),
+        ),
         lifespan,
     )
 

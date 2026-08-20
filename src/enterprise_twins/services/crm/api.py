@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Header, Query, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from enterprise_twins.common.auth.claims import Principal
+from enterprise_twins.common.auth.scenario import ScenarioAccess
 from enterprise_twins.common.auth.verifier import BearerAuthenticator, require_scopes
 from enterprise_twins.common.control.contracts import FaultEffect
 from enterprise_twins.common.events.contracts import (
@@ -35,6 +36,7 @@ def crm_router(
     service: CrmService,
     authenticator: BearerAuthenticator,
     relay: RelayClient | None,
+    scenario_access: ScenarioAccess,
 ) -> APIRouter:
     router = APIRouter()
     AnyPrincipal = Annotated[Principal, Depends(authenticator.authenticate)]
@@ -53,7 +55,7 @@ def crm_router(
 
     @router.get("/v1/customers")
     async def search_customers(
-        _principal: ReadPrincipal,
+        principal: ReadPrincipal,
         email: str | None = None,
         external_reference: str | None = Query(default=None, alias="externalReference"),
         identifier: str | None = None,
@@ -66,15 +68,16 @@ def crm_router(
             identifier=identifier,
             limit=limit,
             after=after,
+            expected_epoch=principal.scenario_epoch,
         )
 
     @router.get("/v1/customers/{customer_id}")
     async def get_customer(
         customer_id: str,
-        _principal: ReadPrincipal,
+        principal: ReadPrincipal,
         response: Response,
     ) -> CustomerView:
-        customer = await repository.get(customer_id)
+        customer = await repository.get(customer_id, principal.scenario_epoch)
         response.headers["ETag"] = f'"{customer.version}"'
         response.headers["X-Resource-Version"] = str(customer.version)
         return customer
@@ -82,7 +85,7 @@ def crm_router(
     @router.get("/v1/customers/{customer_id}/notes")
     async def list_notes(
         customer_id: str,
-        _principal: ReadPrincipal,
+        principal: ReadPrincipal,
         include_archived: bool = Query(default=False, alias="includeArchived"),
         limit: int = Query(default=50, ge=1, le=100),
         after: str | None = None,
@@ -92,6 +95,7 @@ def crm_router(
             include_archived,
             limit,
             after,
+            principal.scenario_epoch,
         )
 
     @router.post("/v1/customers/{customer_id}/notes")
@@ -133,7 +137,8 @@ def crm_router(
         )
 
     @router.get("/v1/capabilities")
-    async def capabilities(_principal: AnyPrincipal) -> dict[str, object]:
+    async def capabilities(principal: AnyPrincipal) -> dict[str, object]:
+        await scenario_access.require(principal.scenario_epoch)
         return {
             "service": "crm",
             "capabilities": ["crm:read", "crm:notes:write", "webhooks:manage"],
@@ -155,15 +160,18 @@ def crm_router(
                 status_code=503,
                 retryable=True,
             )
-        return await relay.create_subscription(
-            principal.subject,
-            idempotency_key,
-            body,
+        return await scenario_access.run(
+            principal.scenario_epoch,
+            lambda: relay.create_subscription(
+                principal.subject,
+                idempotency_key,
+                body,
+            ),
         )
 
     @router.get("/v1/webhook-subscriptions")
     async def list_subscriptions(
-        _principal: WebhookPrincipal,
+        principal: WebhookPrincipal,
     ) -> list[WebhookSubscriptionView]:
         if relay is None:
             raise ApiError(
@@ -172,7 +180,10 @@ def crm_router(
                 status_code=503,
                 retryable=True,
             )
-        return await relay.list_subscriptions()
+        return await scenario_access.run(
+            principal.scenario_epoch,
+            relay.list_subscriptions,
+        )
 
     @router.delete("/v1/webhook-subscriptions/{subscription_id}", status_code=204)
     async def delete_subscription(
@@ -192,11 +203,14 @@ def crm_router(
                 status_code=503,
                 retryable=True,
             )
-        await relay.delete_subscription(
-            principal.subject,
-            idempotency_key,
-            subscription_id,
-            expected_version,
+        await scenario_access.run(
+            principal.scenario_epoch,
+            lambda: relay.delete_subscription(
+                principal.subject,
+                idempotency_key,
+                subscription_id,
+                expected_version,
+            ),
         )
 
     return router

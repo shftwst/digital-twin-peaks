@@ -3,6 +3,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Header, Path
 
+from enterprise_twins.common.auth.credentials import parse_bearer
 from enterprise_twins.common.control.client import ControlClient
 from enterprise_twins.common.events.contracts import (
     EventEnvelope,
@@ -25,8 +26,8 @@ def relay_router(
 
     def authorise(source: str, authorization: str | None) -> None:
         expected = settings.source_tokens.get(source, "")
-        supplied = authorization.removeprefix("Bearer ") if authorization else ""
-        if not expected or not hmac.compare_digest(expected, supplied):
+        supplied = parse_bearer(authorization)
+        if not expected or supplied is None or not hmac.compare_digest(expected, supplied):
             raise ApiError(
                 ErrorCode.UNAUTHENTICATED,
                 "invalid source credential",

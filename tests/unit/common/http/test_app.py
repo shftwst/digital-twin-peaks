@@ -1,7 +1,9 @@
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 
 from enterprise_twins.common.http.app import create_app
+from enterprise_twins.common.http.context import bind_response_epoch
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 
 
@@ -34,6 +36,45 @@ async def oauth_probe() -> dict[str, str]:
 @router.get("/v1/internal-failure")
 async def internal_failure() -> None:
     raise RuntimeError("database password is sensitive-value")
+
+
+@router.get("/epoch-bound-response")
+async def epoch_bound_response(response: Response) -> dict[str, str]:
+    response.headers["X-Scenario-Epoch"] = "epoch_bound_to_body"
+    return {"scenarioEpoch": "epoch_bound_to_body"}
+
+
+@router.get("/v1/epoch-bound-api-error")
+async def epoch_bound_api_error() -> None:
+    bind_response_epoch("epoch_bound_to_error")
+    raise ApiError(ErrorCode.CONFLICT, "version changed", status_code=409)
+
+
+@router.get("/v1/epoch-bound-validation-error")
+async def epoch_bound_validation_error() -> None:
+    bind_response_epoch("epoch_bound_to_error")
+    raise RequestValidationError(
+        [
+            {
+                "type": "missing",
+                "loc": ("query", "needed"),
+                "msg": "Field required",
+                "input": None,
+            }
+        ]
+    )
+
+
+@router.get("/v1/epoch-bound-http-error")
+async def epoch_bound_http_error() -> None:
+    bind_response_epoch("epoch_bound_to_error")
+    raise HTTPException(status_code=404, detail="missing")
+
+
+@router.get("/v1/epoch-bound-internal-error")
+async def epoch_bound_internal_error() -> None:
+    bind_response_epoch("epoch_bound_to_error")
+    raise RuntimeError("sensitive old-epoch failure")
 
 
 client = TestClient(create_app("probe", ("probe:read",), ReadyStatus(), (router,)))
@@ -104,3 +145,25 @@ def test_unexpected_exception_uses_redacted_internal_error_envelope() -> None:
     }
     assert response.headers["X-Scenario-Epoch"] == "epoch_test"
     assert "sensitive-value" not in response.text
+
+
+def test_request_middleware_preserves_an_epoch_bound_by_business_work() -> None:
+    response = client.get("/epoch-bound-response")
+
+    assert response.json() == {"scenarioEpoch": "epoch_bound_to_body"}
+    assert response.headers["X-Scenario-Epoch"] == "epoch_bound_to_body"
+
+
+def test_error_handlers_prefer_the_epoch_bound_by_business_work() -> None:
+    error_client = TestClient(client.app, raise_server_exceptions=False)
+
+    for path, expected_status in (
+        ("/v1/epoch-bound-api-error", 409),
+        ("/v1/epoch-bound-validation-error", 422),
+        ("/v1/epoch-bound-http-error", 404),
+        ("/v1/epoch-bound-internal-error", 500),
+    ):
+        response = error_client.get(path, headers={"X-Correlation-Id": "case-bound-error"})
+
+        assert response.status_code == expected_status
+        assert response.headers["X-Scenario-Epoch"] == "epoch_bound_to_error"

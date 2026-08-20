@@ -2,6 +2,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_twins.common.db.records import ScenarioState
+from enterprise_twins.common.http.context import bind_response_epoch
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.crm.models import Customer, CustomerNote
 from enterprise_twins.services.crm.schemas import (
@@ -51,9 +52,21 @@ class CustomerRepository:
         self.factory = factory
         self.cursor_secret = cursor_secret
 
-    async def active_epoch(self, session: AsyncSession) -> str:
-        state = await session.get(ScenarioState, 1)
-        if state is None or state.mode != "active":
+    async def active_epoch(
+        self,
+        session: AsyncSession,
+        expected_epoch: str | None = None,
+    ) -> str:
+        state = await session.scalar(
+            select(ScenarioState).where(ScenarioState.singleton_id == 1).with_for_update(read=True)
+        )
+        if state is not None:
+            bind_response_epoch(state.active_epoch)
+        if (
+            state is None
+            or state.mode != "active"
+            or (expected_epoch is not None and state.active_epoch != expected_epoch)
+        ):
             raise ApiError(
                 ErrorCode.TEMPORARILY_UNAVAILABLE,
                 "CRM scenario is not active",
@@ -70,9 +83,10 @@ class CustomerRepository:
         identifier: str | None,
         limit: int,
         after: str | None,
+        expected_epoch: str | None = None,
     ) -> CustomerPage:
         async with self.factory() as session:
-            epoch = await self.active_epoch(session)
+            epoch = await self.active_epoch(session, expected_epoch)
             statement = select(Customer).where(Customer.scenario_epoch == epoch)
             if email is not None:
                 statement = statement.where(func.lower(Customer.primary_email) == email.casefold())
@@ -107,9 +121,9 @@ class CustomerRepository:
                 ),
             )
 
-    async def get(self, customer_id: str) -> CustomerView:
+    async def get(self, customer_id: str, expected_epoch: str | None = None) -> CustomerView:
         async with self.factory() as session:
-            epoch = await self.active_epoch(session)
+            epoch = await self.active_epoch(session, expected_epoch)
             customer = await session.scalar(
                 select(Customer).where(
                     Customer.scenario_epoch == epoch,
@@ -130,9 +144,10 @@ class CustomerRepository:
         include_archived: bool,
         limit: int,
         after: str | None,
+        expected_epoch: str | None = None,
     ) -> NotePage:
         async with self.factory() as session:
-            epoch = await self.active_epoch(session)
+            epoch = await self.active_epoch(session, expected_epoch)
             customer_exists = await session.scalar(
                 select(Customer.row_id).where(
                     Customer.scenario_epoch == epoch,

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_twins.common.canonical import sha256_hex
 from enterprise_twins.common.control.contracts import (
+    ClockValue,
     FaultDecision,
     FaultEffect,
     ParticipantLoadRequest,
@@ -51,6 +52,9 @@ class Clock:
 
     async def now(self) -> datetime:
         return self.value
+
+    async def snapshot(self) -> ClockValue:
+        return ClockValue(now=self.value, scenarioEpoch=self.epoch)
 
     async def current_epoch(self) -> str:
         return self.epoch
@@ -207,6 +211,31 @@ async def test_event_is_stored_once_and_delivered_with_valid_signature(
     assert len(attempts) == 1
     assert attempts[0].attempt_number == 1
     assert attempts[0].outcome == "acknowledged"
+
+
+@pytest.mark.asyncio
+async def test_delivery_uses_one_atomic_control_snapshot(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db)
+    await create_subscription_and_event(repository)
+    requests: list[httpx.Request] = []
+
+    class SplitClock(Clock):
+        async def snapshot(self) -> ClockValue:
+            return ClockValue(now=NOW, scenarioEpoch="epoch_1")
+
+        async def now(self) -> datetime:
+            return NOW + timedelta(hours=1)
+
+    async def receive(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(receive)) as client:
+        assert await WebhookWorker(repository, SplitClock(), client).run_once() == 1
+
+    assert requests[0].headers["X-Twin-Timestamp"] == "2026-08-19T10:00:00Z"
 
 
 @pytest.mark.asyncio
@@ -620,6 +649,177 @@ async def test_duplicate_fault_records_acknowledgement_when_either_copy_succeeds
     assert attempt.response_status == 204
 
 
+class EndlessBody(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.iterated = False
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.iterated = True
+        while True:
+            await asyncio.sleep(0.01)
+            yield b"endless"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_delivery_acknowledges_headers_without_entering_an_endless_body_stream(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db)
+    await create_subscription_and_event(repository)
+    body = EndlessBody()
+
+    async def receive(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(204, stream=body)
+
+    completed = False
+    async with httpx.AsyncClient(transport=httpx.MockTransport(receive)) as client:
+        try:
+            async with asyncio.timeout(0.4):
+                assert await WebhookWorker(repository, Clock(), client).run_once() == 1
+                completed = True
+        except TimeoutError:
+            pass
+
+    assert completed is True
+    assert body.iterated is False
+    assert body.closed is True
+    async with db() as session:
+        attempt = await session.scalar(select(DeliveryAttempt))
+    assert attempt is not None
+    assert attempt.outcome == "acknowledged"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_loop_total_timeout_without_success_is_failed_and_releases_reset_fence(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db, epoch="epoch_old")
+    await create_subscription_and_event(repository)
+    second_entered = asyncio.Event()
+    release_second = asyncio.Event()
+    calls = 0
+
+    async def receive(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(500)
+        second_entered.set()
+        await release_second.wait()
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(receive)) as client:
+        worker = WebhookWorker(
+            repository,
+            Clock(epoch="epoch_old", decision=FaultDecision(effect=FaultEffect.DUPLICATE)),
+            client,
+        )
+        delivery_task = asyncio.create_task(worker.run_once())
+        await second_entered.wait()
+        prepare_task = asyncio.create_task(
+            ResetParticipant(db, RelayScenarioLoader(), "relay").prepare("epoch_new")
+        )
+        completed_without_receiver_release = True
+        try:
+            async with asyncio.timeout(2.5):
+                await asyncio.shield(asyncio.gather(delivery_task, prepare_task))
+        except TimeoutError:
+            completed_without_receiver_release = False
+            release_second.set()
+            await asyncio.gather(delivery_task, prepare_task)
+
+    assert completed_without_receiver_release is True
+    async with db() as session:
+        delivery = await session.scalar(select(Delivery))
+        attempt = await session.scalar(select(DeliveryAttempt))
+        state = await session.get(ScenarioState, 1)
+    assert delivery is not None
+    assert attempt is not None
+    assert state is not None
+    assert delivery.state == "pending"
+    assert attempt.response_status is None
+    assert attempt.outcome == "total_timeout"
+    assert state.mode == "preparing"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_loop_keeps_first_acknowledgement_when_a_later_copy_times_out(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db)
+    await create_subscription_and_event(repository)
+    second_entered = asyncio.Event()
+    release_second = asyncio.Event()
+    calls = 0
+
+    async def receive(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(204)
+        second_entered.set()
+        await release_second.wait()
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(receive)) as client:
+        delivery_task = asyncio.create_task(
+            WebhookWorker(
+                repository,
+                Clock(decision=FaultDecision(effect=FaultEffect.DUPLICATE)),
+                client,
+            ).run_once()
+        )
+        await second_entered.wait()
+        completed_without_receiver_release = True
+        try:
+            async with asyncio.timeout(2.5):
+                await asyncio.shield(delivery_task)
+        except TimeoutError:
+            completed_without_receiver_release = False
+            release_second.set()
+            await delivery_task
+
+    assert completed_without_receiver_release is True
+    async with db() as session:
+        delivery = await session.scalar(select(Delivery))
+        attempt = await session.scalar(select(DeliveryAttempt))
+    assert delivery is not None
+    assert attempt is not None
+    assert delivery.state == "delivered"
+    assert attempt.response_status == 204
+    assert attempt.outcome == "acknowledged"
+
+
+@pytest.mark.asyncio
+async def test_external_worker_cancellation_is_not_recorded_as_a_delivery_timeout(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db)
+    await create_subscription_and_event(repository)
+    request_entered = asyncio.Event()
+
+    async def receive(_request: httpx.Request) -> httpx.Response:
+        request_entered.set()
+        await asyncio.Event().wait()
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(receive)) as client:
+        delivery_task = asyncio.create_task(WebhookWorker(repository, Clock(), client).run_once())
+        await request_entered.wait()
+        delivery_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await delivery_task
+
+    async with db() as session:
+        attempt = await session.scalar(select(DeliveryAttempt))
+    assert attempt is not None
+    assert attempt.outcome == "in_flight"
+
+
 @pytest.mark.asyncio
 async def test_reset_prepare_waits_for_an_outbound_request_holding_the_epoch_fence(
     db: async_sessionmaker[AsyncSession],
@@ -762,3 +962,18 @@ async def test_reset_loader_deletes_only_the_discarded_epoch(
         for model in (Subscription, SourceEvent, Delivery, DeliveryAttempt):
             epochs = list(await session.scalars(select(model.scenario_epoch)))
             assert epochs == ["epoch_new"]
+
+
+@pytest.mark.asyncio
+async def test_relay_loader_rejects_an_unsupported_schema_before_staging(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    payload = {
+        "schemaVersion": "2",
+        "subscriptions": [],
+    }
+
+    async with db() as session:
+        with pytest.raises(ValueError, match="schemaVersion"):
+            await RelayScenarioLoader().load(session, "epoch_new", payload)
+        assert not session.new

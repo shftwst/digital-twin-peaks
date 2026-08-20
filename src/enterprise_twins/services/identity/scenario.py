@@ -18,6 +18,8 @@ class IdentityScenarioLoader:
         epoch: str,
         payload: dict[str, Any],
     ) -> dict[str, object]:
+        if payload.get("schemaVersion") != "1":
+            raise ValueError('Identity schemaVersion must be "1"')
         clients = payload["clients"]
         client_ids = [item["clientId"] for item in clients]
         if len(client_ids) != len(set(client_ids)):

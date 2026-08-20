@@ -555,7 +555,7 @@ async def test_cleanup_failure_returns_503_then_next_reset_recovers_before_new_r
         scenario_id="platform-contracts",
         version=1,
         initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
-        payloads={"identity": {"expectedCounts": {}}},
+        payloads={"identity": {"schemaVersion": "1", "expectedCounts": {}, "aliases": {}}},
     )
     store = ControlResetStore(db)
     coordinator = ResetCoordinator(

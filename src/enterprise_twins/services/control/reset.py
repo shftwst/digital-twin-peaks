@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol
 
 import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -229,6 +229,10 @@ class ResetCoordinator:
                         or report.counts != payload["expectedCounts"]
                     ):
                         raise RuntimeError(f"{name} reset verification failed")
+                    if report.schema_version != payload.get("schemaVersion"):
+                        raise RuntimeError(f"{name} reset schemaVersion verification failed")
+                    if report.aliases != payload.get("aliases", {}):
+                        raise RuntimeError(f"{name} reset aliases verification failed")
                     reports.append(report)
                 for participant in self.participants.values():
                     await participant.commit(epoch)
@@ -502,8 +506,9 @@ def reset_router(
             ) from error
 
     @router.get("/control/v1/status")
-    async def status(_auth: ControllerAuth) -> dict[str, object]:
-        state = await repository.state()
+    async def status(_auth: ControllerAuth, response: Response) -> dict[str, object]:
+        state, now = await repository.status_snapshot()
+        response.headers["X-Scenario-Epoch"] = state.active_epoch
         return {
             "scenarioId": state.scenario_id,
             "version": state.scenario_version,
@@ -517,7 +522,7 @@ def reset_router(
                 and state.pending_epoch is not None
                 and state.active_epoch == state.pending_epoch
             ),
-            "now": await repository.now(),
+            "now": now,
         }
 
     return router

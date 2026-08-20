@@ -6,7 +6,7 @@ from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from enterprise_twins.common.control.contracts import FaultDecision
+from enterprise_twins.common.control.contracts import ClockValue, FaultDecision
 from enterprise_twins.common.db.records import OutboxRecord, ScenarioState
 from enterprise_twins.common.events.contracts import (
     EventEnvelope,
@@ -26,6 +26,9 @@ NOW = datetime(2026, 8, 19, 10, tzinfo=UTC)
 
 
 class Clock:
+    async def snapshot(self) -> ClockValue:
+        return ClockValue(now=NOW, scenarioEpoch="epoch_1")
+
     async def now(self) -> datetime:
         return NOW
 
@@ -162,6 +165,37 @@ async def test_source_routes_enforce_roles_redact_tokens_and_replay_original_sec
             headers={"Authorization": "Bearer crm-source-secret"},
         )
         assert cross_source.status_code == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "authorization",
+    [
+        "crm-source-secret",
+        "bearer crm-source-secret",
+        "Bearer\tcrm-source-secret",
+        "Bearer  crm-source-secret",
+        " Bearer crm-source-secret",
+        "Bearer crm-source-secret ",
+        "Bearer crm source-secret",
+    ],
+)
+async def test_source_routes_reject_noncanonical_bearer_headers_before_repository_work(
+    db: async_sessionmaker[AsyncSession],
+    authorization: str,
+) -> None:
+    repository = await initialise_relay(db)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=relay_app(db, repository)),
+        base_url="http://relay",
+    ) as client:
+        response = await client.get(
+            "/internal/v1/sources/crm/subscriptions",
+            headers={"Authorization": authorization},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthenticated"
 
 
 @pytest.mark.asyncio

@@ -10,14 +10,21 @@ from enterprise_twins.common.http.errors import ErrorBody, ErrorCode, ErrorEnvel
 from enterprise_twins.common.ids import new_id
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class RequestContext:
     request_id: str
     correlation_id: str
     traceparent: str | None
+    response_epoch: str | None = None
 
 
 current_request: ContextVar[RequestContext | None] = ContextVar("current_request", default=None)
+
+
+def bind_response_epoch(epoch: str) -> None:
+    context = current_request.get()
+    if context is not None:
+        context.response_epoch = epoch
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -50,13 +57,15 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         context = RequestContext(
             request_id, correlation_id or request_id, request.headers.get("traceparent")
         )
+        request.state.request_context = context
         token = current_request.set(context)
         try:
             response = await call_next(request)
         finally:
             current_request.reset(token)
         response.headers["X-Request-Id"] = request_id
-        response.headers["X-Scenario-Epoch"] = await self.epoch()
+        if "X-Scenario-Epoch" not in response.headers:
+            response.headers["X-Scenario-Epoch"] = context.response_epoch or await self.epoch()
         if context.traceparent:
             response.headers["traceparent"] = context.traceparent
         return response

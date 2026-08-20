@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 
 from enterprise_twins.common.control.auth import require_token
 from enterprise_twins.common.control.contracts import (
@@ -22,26 +22,29 @@ def control_router(repository: ControlRepository, settings: ControlSettings) -> 
     ControllerAuth = Annotated[None, Depends(controller_auth)]
 
     @router.get("/time")
-    async def get_time(_auth: TwinAuth) -> ClockValue:
-        state = await repository.state()
-        return ClockValue(now=await repository.now(), scenarioEpoch=state.active_epoch)
+    async def get_time(_auth: TwinAuth, response: Response) -> ClockValue:
+        result = await repository.snapshot()
+        response.headers["X-Scenario-Epoch"] = result.scenario_epoch
+        return result
 
     @router.put("/time")
-    async def set_time(request: SetClockRequest, _auth: ControllerAuth) -> ClockValue:
-        state = await repository.state()
-        return ClockValue(
-            now=await repository.set_time(request.now), scenarioEpoch=state.active_epoch
-        )
+    async def set_time(
+        request: SetClockRequest, _auth: ControllerAuth, response: Response
+    ) -> ClockValue:
+        result = await repository.set_time(request.now)
+        response.headers["X-Scenario-Epoch"] = result.scenario_epoch
+        return result
 
     @router.post("/time/advance")
-    async def advance_time(request: AdvanceClockRequest, _auth: ControllerAuth) -> ClockValue:
+    async def advance_time(
+        request: AdvanceClockRequest, _auth: ControllerAuth, response: Response
+    ) -> ClockValue:
         try:
             amount = parse_duration(request.duration)
         except (OverflowError, ValueError) as error:
             raise ApiError(ErrorCode.INVALID_REQUEST, str(error), status_code=422) from error
-        state = await repository.state()
-        return ClockValue(
-            now=await repository.advance_time(amount), scenarioEpoch=state.active_epoch
-        )
+        result = await repository.advance_time(amount)
+        response.headers["X-Scenario-Epoch"] = result.scenario_epoch
+        return result
 
     return router

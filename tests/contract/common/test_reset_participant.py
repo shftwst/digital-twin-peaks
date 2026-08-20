@@ -232,8 +232,16 @@ async def test_later_commit_failure_restores_every_participant_epoch_data_and_me
         version=1,
         initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
         payloads={
-            "identity": {"expectedCounts": {"records": 2}},
-            "crm": {"expectedCounts": {"records": 3}},
+            "identity": {
+                "schemaVersion": "1",
+                "expectedCounts": {"records": 2},
+                "aliases": {},
+            },
+            "crm": {
+                "schemaVersion": "1",
+                "expectedCounts": {"records": 3},
+                "aliases": {},
+            },
         },
     )
     coordinator = ResetCoordinator.for_test(

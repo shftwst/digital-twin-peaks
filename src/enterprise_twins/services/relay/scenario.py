@@ -18,6 +18,8 @@ class RelayScenarioLoader:
         epoch: str,
         payload: dict[str, Any],
     ) -> dict[str, object]:
+        if payload.get("schemaVersion") != "1":
+            raise ValueError('Relay schemaVersion must be "1"')
         subscriptions = payload.get("subscriptions", [])
         if subscriptions:
             raise ValueError("platform-contracts Relay seed must start without subscriptions")

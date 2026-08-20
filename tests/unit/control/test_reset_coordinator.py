@@ -19,12 +19,16 @@ class Participant:
         fail_on: str | None = None,
         *,
         finalize_failures: int = 0,
+        report_schema_version: str | None = None,
+        report_aliases: dict[str, str] | None = None,
     ) -> None:
         self.name = name
         self.fail_on = fail_on
         self.calls: list[tuple[str, str]] = []
         self.active_epoch = "epoch_old"
         self.finalize_failures = finalize_failures
+        self.report_schema_version = report_schema_version
+        self.report_aliases = report_aliases
 
     async def prepare(self, epoch: str) -> None:
         self.calls.append(("prepare", epoch))
@@ -35,8 +39,13 @@ class Participant:
             raise RuntimeError(f"{self.name} load failed")
         return ParticipantReport(
             service=self.name,
-            schemaVersion="1",
+            schemaVersion=self.report_schema_version or str(request.payload["schemaVersion"]),
             counts=request.payload["expectedCounts"],
+            aliases=(
+                self.report_aliases
+                if self.report_aliases is not None
+                else request.payload.get("aliases", {})
+            ),
             checksum=request.checksum,
         )
 
@@ -69,8 +78,8 @@ async def test_reset_is_ordered_and_same_inputs_have_same_checksum() -> None:
         version=1,
         initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
         payloads={
-            "identity": {"expectedCounts": {"clients": 2}},
-            "crm": {"expectedCounts": {"customers": 3}},
+            "identity": {"schemaVersion": "1", "expectedCounts": {"clients": 2}},
+            "crm": {"schemaVersion": "1", "expectedCounts": {"customers": 3}},
         },
     )
     coordinator = ResetCoordinator.for_test({"identity": identity, "crm": crm}, bundle)
@@ -111,7 +120,10 @@ async def test_failed_load_aborts_every_participant_and_marks_estate_unhealthy()
         scenario_id="platform-contracts",
         version=1,
         initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
-        payloads={"identity": {"expectedCounts": {}}, "crm": {"expectedCounts": {}}},
+        payloads={
+            "identity": {"schemaVersion": "1", "expectedCounts": {}},
+            "crm": {"schemaVersion": "1", "expectedCounts": {}},
+        },
     )
     coordinator = ResetCoordinator.for_test({"identity": identity, "crm": crm}, bundle)
 
@@ -124,6 +136,45 @@ async def test_failed_load_aborts_every_participant_and_marks_estate_unhealthy()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("participant", "expected_failure"),
+    [
+        (
+            Participant("identity", report_schema_version="2"),
+            "schemaVersion",
+        ),
+        (
+            Participant("identity", report_aliases={"primary": "unexpected"}),
+            "aliases",
+        ),
+    ],
+)
+async def test_report_schema_and_alias_mismatch_aborts_before_any_commit(
+    participant: Participant,
+    expected_failure: str,
+) -> None:
+    bundle = ScenarioBundle(
+        scenario_id="platform-contracts",
+        version=1,
+        initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
+        payloads={
+            "identity": {
+                "schemaVersion": "1",
+                "expectedCounts": {},
+                "aliases": {"primary": "client-1"},
+            }
+        },
+    )
+    coordinator = ResetCoordinator.for_test({"identity": participant}, bundle)
+
+    with pytest.raises(RuntimeError, match=expected_failure):
+        await coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+
+    assert all(action != "commit" for action, _epoch in participant.calls)
+    assert participant.calls[-1][0] == "abort"
+
+
+@pytest.mark.asyncio
 async def test_finalize_failure_keeps_every_participant_on_the_new_epoch_without_abort() -> None:
     identity = Participant("identity", fail_on="finalize")
     crm = Participant("crm")
@@ -131,7 +182,10 @@ async def test_finalize_failure_keeps_every_participant_on_the_new_epoch_without
         scenario_id="platform-contracts",
         version=1,
         initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
-        payloads={"identity": {"expectedCounts": {}}, "crm": {"expectedCounts": {}}},
+        payloads={
+            "identity": {"schemaVersion": "1", "expectedCounts": {}},
+            "crm": {"schemaVersion": "1", "expectedCounts": {}},
+        },
     )
     coordinator = ResetCoordinator.for_test({"identity": identity, "crm": crm}, bundle)
 
@@ -155,7 +209,10 @@ async def test_participant_services_must_exactly_match_bundle_before_reset_begin
         scenario_id="platform-contracts",
         version=1,
         initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
-        payloads={"identity": {"expectedCounts": {}}, "crm": {"expectedCounts": {}}},
+        payloads={
+            "identity": {"schemaVersion": "1", "expectedCounts": {}},
+            "crm": {"schemaVersion": "1", "expectedCounts": {}},
+        },
     )
     coordinator = ResetCoordinator.for_test({"identity": identity}, bundle)
 
@@ -225,7 +282,10 @@ async def test_next_reset_recovers_persisted_cleanup_before_starting_new_epoch()
         scenario_id="platform-contracts",
         version=1,
         initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
-        payloads={"identity": {"expectedCounts": {}}, "crm": {"expectedCounts": {}}},
+        payloads={
+            "identity": {"schemaVersion": "1", "expectedCounts": {}},
+            "crm": {"schemaVersion": "1", "expectedCounts": {}},
+        },
     )
     pending_epoch: str | None = None
 
@@ -283,7 +343,7 @@ async def test_repeated_cleanup_recovery_failure_retains_epoch_and_does_not_begi
         scenario_id="platform-contracts",
         version=1,
         initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
-        payloads={"identity": {"expectedCounts": {}}},
+        payloads={"identity": {"schemaVersion": "1", "expectedCounts": {}}},
     )
     pending_epoch: str | None = None
     begin_calls = 0
@@ -334,7 +394,7 @@ async def test_cleanup_response_stays_retryable_when_failure_marker_cannot_be_up
         scenario_id="platform-contracts",
         version=1,
         initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
-        payloads={"identity": {"expectedCounts": {}}},
+        payloads={"identity": {"schemaVersion": "1", "expectedCounts": {}}},
     )
 
     async def begin(_epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:

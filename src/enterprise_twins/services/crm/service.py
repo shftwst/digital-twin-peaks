@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from enterprise_twins.common.auth.claims import Principal
 from enterprise_twins.common.canonical import sha256_hex
 from enterprise_twins.common.control.contracts import (
+    ClockValue,
     FaultDecision,
     FaultEffect,
     FaultPhase,
@@ -21,7 +22,7 @@ from enterprise_twins.common.db.idempotency import (
 )
 from enterprise_twins.common.db.records import ScenarioState
 from enterprise_twins.common.events.publisher import record_audit, record_event
-from enterprise_twins.common.http.context import current_request
+from enterprise_twins.common.http.context import bind_response_epoch, current_request
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.common.ids import new_id
 from enterprise_twins.services.crm.models import Customer, CustomerNote
@@ -30,6 +31,9 @@ from enterprise_twins.services.crm.schemas import NoteCreate
 
 
 class CrmControl(Protocol):
+    async def snapshot(self) -> ClockValue:
+        raise NotImplementedError
+
     async def now(self) -> datetime:
         raise NotImplementedError
 
@@ -70,8 +74,9 @@ class CrmService:
         context = current_request.get()
         if context is None:
             raise RuntimeError("request context is missing")
-        now = await self.control.now()
-        epoch = await self.control.current_epoch()
+        snapshot = await self.control.snapshot()
+        now = snapshot.now
+        epoch = snapshot.scenario_epoch
         namespace = IdempotencyNamespace(
             principal.tenant_id,
             principal.subject,
@@ -89,7 +94,14 @@ class CrmService:
                 .where(ScenarioState.singleton_id == 1)
                 .with_for_update(read=True)
             )
-            if state is None or state.mode != "active" or state.active_epoch != epoch:
+            if state is not None:
+                bind_response_epoch(state.active_epoch)
+            if (
+                state is None
+                or state.mode != "active"
+                or state.active_epoch != epoch
+                or principal.scenario_epoch != state.active_epoch
+            ):
                 raise ApiError(
                     ErrorCode.TEMPORARILY_UNAVAILABLE,
                     "CRM scenario is not active",

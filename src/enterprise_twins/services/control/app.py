@@ -40,8 +40,7 @@ class ControlStatus:
 
     async def readiness(self) -> tuple[bool, dict[str, str]]:
         try:
-            state = await self.repository.state()
-            await self.repository.now()
+            state, _now = await self.repository.status_snapshot()
         except (OSError, RuntimeError, SQLAlchemyError):  # fmt: skip
             return False, {"database": "not_ready", "clock": "not_ready"}
         ready = state.mode == "active" and state.pending_epoch is None

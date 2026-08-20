@@ -8,6 +8,8 @@ import jwt
 from fastapi import Depends, Header
 
 from enterprise_twins.common.auth.claims import Principal
+from enterprise_twins.common.auth.credentials import parse_bearer
+from enterprise_twins.common.control.contracts import ClockValue
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 
 MIN_NUMERIC_DATE = -62_135_596_800
@@ -15,6 +17,9 @@ MAX_NUMERIC_DATE_EXCLUSIVE = 253_402_300_800
 
 
 class TokenClock(Protocol):
+    async def snapshot(self) -> ClockValue:
+        raise NotImplementedError
+
     async def now(self) -> datetime:
         raise NotImplementedError
 
@@ -123,7 +128,8 @@ class JwtVerifier:
                     ],
                 },
             )
-            now = (await self.clock.now()).timestamp()
+            snapshot = await self.clock.snapshot()
+            now = snapshot.now.timestamp()
             if self.numeric_date(claims, "exp") <= now:
                 raise jwt.ExpiredSignatureError
             if self.numeric_date(claims, "nbf") > now:
@@ -131,7 +137,7 @@ class JwtVerifier:
             if self.numeric_date(claims, "iat") > now:
                 raise jwt.ImmatureSignatureError
             scenario_epoch = self.required_text(claims, "scenario_epoch")
-            if scenario_epoch != await self.clock.current_epoch():
+            if scenario_epoch != snapshot.scenario_epoch:
                 raise jwt.InvalidTokenError("token belongs to another scenario epoch")
             subject = self.required_text(claims, "sub")
             actor_type = self.required_text(claims, "actor_type")
@@ -188,7 +194,8 @@ class BearerAuthenticator:
         self,
         authorization: Annotated[str | None, Header()] = None,
     ) -> Principal:
-        if authorization is None or not authorization.startswith("Bearer "):
+        token = parse_bearer(authorization)
+        if token is None:
             if self.recorder is not None:
                 await self.recorder.record(None, (), False)
             raise ApiError(
@@ -197,7 +204,7 @@ class BearerAuthenticator:
                 status_code=401,
             )
         try:
-            principal = await self.verifier.verify(authorization.removeprefix("Bearer "))
+            principal = await self.verifier.verify(token)
         except ApiError as error:
             if self.recorder is not None and error.code == ErrorCode.UNAUTHENTICATED:
                 await self.recorder.record(None, (), False)

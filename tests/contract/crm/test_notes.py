@@ -1,3 +1,5 @@
+# ruff: noqa: S106
+
 import asyncio
 import base64
 import hashlib
@@ -15,8 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Scope
 
+from enterprise_twins.common.auth.claims import Principal
 from enterprise_twins.common.canonical import canonical_json
-from enterprise_twins.common.control.contracts import FaultDecision, FaultEffect
+from enterprise_twins.common.control.contracts import ClockValue, FaultDecision, FaultEffect
 from enterprise_twins.common.control.participant import ResetParticipant
 from enterprise_twins.common.db.records import (
     AuditRecord,
@@ -24,9 +27,12 @@ from enterprise_twins.common.db.records import (
     OutboxRecord,
     ScenarioState,
 )
-from enterprise_twins.common.http.errors import ErrorCode
+from enterprise_twins.common.http.context import RequestContext, current_request
+from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.crm.models import Customer, CustomerNote
 from enterprise_twins.services.crm.scenario import CrmScenarioLoader
+from enterprise_twins.services.crm.schemas import NoteCreate
+from enterprise_twins.services.crm.service import CrmService
 
 
 class ControlState(Protocol):
@@ -204,6 +210,134 @@ async def test_note_create_replays_original_result_and_changed_payload_conflicts
 
 
 @pytest.mark.asyncio
+async def test_note_create_uses_one_atomic_control_snapshot(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    snapshot_time = datetime(2026, 8, 19, 10, 5, tzinfo=UTC)
+
+    class SplitControl:
+        async def snapshot(self) -> ClockValue:
+            return ClockValue(now=snapshot_time, scenarioEpoch="epoch_1")
+
+        async def now(self) -> datetime:
+            return datetime(2026, 8, 18, 9, tzinfo=UTC)
+
+        async def current_epoch(self) -> str:
+            return "epoch_1"
+
+        async def ready_epoch(self) -> str:
+            return "epoch_1"
+
+        async def evaluate_fault(self, _probe: object) -> FaultDecision:
+            return FaultDecision()
+
+    async with db.begin() as session:
+        session.add(ScenarioState(singleton_id=1, mode="active", active_epoch="epoch_1"))
+        session.add(
+            Customer(
+                row_id="crow_atomic_snapshot",
+                scenario_epoch="epoch_1",
+                customer_id="cus_atomic_snapshot",
+                display_name="Atomic Snapshot",
+                primary_email="atomic@example.test",
+                external_reference="ext-atomic",
+                account_status="active",
+                contact_methods=[],
+                external_identifiers={},
+                version=1,
+            )
+        )
+    principal = Principal(
+        subject="person-support-1",
+        actor_type="human",
+        role="support_agent",
+        scopes=frozenset({"crm:notes:write"}),
+        tenant_id="tenant_synthetic",
+        token_id="tok_atomic",
+        scenario_epoch="epoch_1",
+    )
+    context_token = current_request.set(RequestContext("req_atomic", "corr_atomic", None))
+    try:
+        await CrmService(db, SplitControl()).create_note(
+            "cus_atomic_snapshot",
+            NoteCreate(body="atomic time", association="account"),
+            1,
+            "atomic-idempotency",
+            principal,
+        )
+    finally:
+        current_request.reset(context_token)
+
+    async with db() as session:
+        note = await session.scalar(select(CustomerNote).where(CustomerNote.body == "atomic time"))
+    assert note is not None
+    assert note.created_at == snapshot_time
+
+
+@pytest.mark.asyncio
+async def test_old_epoch_principal_cannot_create_a_note_in_the_new_epoch(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    class NewEpochControl:
+        async def snapshot(self) -> ClockValue:
+            return ClockValue(now=datetime(2026, 8, 19, 10, tzinfo=UTC), scenarioEpoch="epoch_new")
+
+        async def now(self) -> datetime:
+            return datetime(2026, 8, 19, 10, tzinfo=UTC)
+
+        async def current_epoch(self) -> str:
+            return "epoch_new"
+
+        async def ready_epoch(self) -> str:
+            return "epoch_new"
+
+        async def evaluate_fault(self, _probe: object) -> FaultDecision:
+            return FaultDecision()
+
+    async with db.begin() as session:
+        session.add(ScenarioState(singleton_id=1, mode="active", active_epoch="epoch_new"))
+        session.add(
+            Customer(
+                row_id="crow_new_epoch",
+                scenario_epoch="epoch_new",
+                customer_id="cus_new_epoch",
+                display_name="New Epoch",
+                primary_email="new-epoch@example.test",
+                external_reference="ext-new-epoch",
+                account_status="active",
+                contact_methods=[],
+                external_identifiers={},
+                version=1,
+            )
+        )
+    old_principal = Principal(
+        subject="person-support-1",
+        actor_type="human",
+        role="support_agent",
+        scopes=frozenset({"crm:notes:write"}),
+        tenant_id="tenant_synthetic",
+        token_id="tok_old_epoch",
+        scenario_epoch="epoch_old",
+    )
+    context_token = current_request.set(RequestContext("req_old", "corr_old", None))
+    try:
+        with pytest.raises(ApiError) as raised:
+            await CrmService(db, NewEpochControl()).create_note(
+                "cus_new_epoch",
+                NoteCreate(body="must not cross epochs", association="account"),
+                1,
+                "old-principal-idempotency",
+                old_principal,
+            )
+    finally:
+        current_request.reset(context_token)
+
+    assert raised.value.status_code == 503
+    assert await count(db, CustomerNote) == 0
+    assert await count(db, IdempotencyRecord) == 0
+
+
+@pytest.mark.asyncio
 async def test_concurrent_same_key_note_calls_converge_on_one_result_and_one_commit(
     crm_client: AsyncClient,
     support_headers: dict[str, str],
@@ -231,6 +365,7 @@ async def test_concurrent_same_key_note_calls_converge_on_one_result_and_one_com
         first = asyncio.create_task(
             crm_client.post("/v1/customers/cus_unique/notes", headers=headers, json=payload)
         )
+        await wait_for_lock_waiters(db, 1, [first])
         second = asyncio.create_task(
             crm_client.post("/v1/customers/cus_unique/notes", headers=headers, json=payload)
         )
@@ -601,8 +736,7 @@ async def test_note_cursor_rejects_tampering_noncanonical_data_and_cross_list_re
 
 @pytest.mark.asyncio
 async def test_note_cursor_cannot_cross_a_scenario_epoch(
-    crm_client: AsyncClient,
-    support_headers: dict[str, str],
+    crm_harness: CrmHarness,
     db: async_sessionmaker[AsyncSession],
 ) -> None:
     async with db.begin() as session:
@@ -626,10 +760,10 @@ async def test_note_cursor_cannot_cross_a_scenario_epoch(
                 ]
             ]
         )
-    first = await crm_client.get(
+    first = await crm_harness.client.get(
         "/v1/customers/cus_unique/notes",
         params={"limit": 1},
-        headers=support_headers,
+        headers=crm_harness.support_headers,
     )
     cursor = first.json()["nextCursor"]
     assert cursor is not None
@@ -667,10 +801,11 @@ async def test_note_cursor_cannot_cross_a_scenario_epoch(
             )
         )
 
-    reused = await crm_client.get(
+    crm_harness.control.epoch = "epoch_2"
+    reused = await crm_harness.client.get(
         "/v1/customers/cus_unique/notes",
         params={"after": cursor},
-        headers=support_headers,
+        headers=crm_harness.future_epoch_headers,
     )
 
     assert reused.status_code == 422

@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from enterprise_twins.common.canonical import canonical_json
 from enterprise_twins.common.control.client import ControlClient
 from enterprise_twins.common.control.contracts import (
+    ClockValue,
     FaultDecision,
     FaultEffect,
     FaultPhase,
@@ -20,6 +21,8 @@ from enterprise_twins.common.http.errors import ApiError
 from enterprise_twins.services.relay.repository import RelayRepository
 from enterprise_twins.services.relay.settings import RelaySettings
 
+DELIVERY_ATTEMPT_TIMEOUT_SECONDS = 2.0
+
 
 def signature(secret: str, timestamp: str, body: bytes) -> str:
     digest = hmac.new(secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256).hexdigest()
@@ -27,6 +30,9 @@ def signature(secret: str, timestamp: str, body: bytes) -> str:
 
 
 class RelayControl(Protocol):
+    async def snapshot(self) -> ClockValue:
+        raise NotImplementedError
+
     async def now(self) -> datetime:
         raise NotImplementedError
 
@@ -49,7 +55,8 @@ class WebhookWorker:
         self.client = client
 
     async def run_once(self) -> int:
-        now = await self.control.now()
+        snapshot = await self.control.snapshot()
+        now = snapshot.now
         candidate = await self.repository.next_delivery(now)
         if candidate is None:
             return 0
@@ -71,7 +78,7 @@ class WebhookWorker:
                 return 1
         if delivery.lease_token is None:
             raise RuntimeError("delivery lease token is missing")
-        control_epoch = await self.control.current_epoch()
+        control_epoch = snapshot.scenario_epoch
         copies = 2 if decision.effect == FaultEffect.DUPLICATE else 1
         async with self.repository.delivery_fence(delivery, control_epoch) as allowed:
             if not allowed:
@@ -79,28 +86,35 @@ class WebhookWorker:
             acknowledged_status: int | None = None
             last_status: int | None = None
             last_transport_error: str | None = None
-            for _copy in range(copies):
-                try:
-                    response = await self.client.post(
-                        subscription.target_url,
-                        content=body,
-                        headers={
-                            "Content-Type": "application/json",
-                            "X-Twin-Event-Id": event.event_id,
-                            "X-Twin-Timestamp": timestamp,
-                            "X-Twin-Signature": signature(
-                                subscription.signing_secret,
-                                timestamp,
-                                body,
-                            ),
-                        },
-                        timeout=2.0,
-                    )
-                    last_status = response.status_code
-                    if 200 <= response.status_code < 300:
-                        acknowledged_status = response.status_code
-                except httpx.HTTPError as error:
-                    last_transport_error = type(error).__name__
+            try:
+                async with asyncio.timeout(DELIVERY_ATTEMPT_TIMEOUT_SECONDS):
+                    for _copy in range(copies):
+                        try:
+                            async with self.client.stream(
+                                "POST",
+                                subscription.target_url,
+                                content=body,
+                                headers={
+                                    "Content-Type": "application/json",
+                                    "X-Twin-Event-Id": event.event_id,
+                                    "X-Twin-Timestamp": timestamp,
+                                    "X-Twin-Signature": signature(
+                                        subscription.signing_secret,
+                                        timestamp,
+                                        body,
+                                    ),
+                                },
+                                timeout=DELIVERY_ATTEMPT_TIMEOUT_SECONDS,
+                            ) as response:
+                                last_status = response.status_code
+                                if 200 <= response.status_code < 300:
+                                    acknowledged_status = response.status_code
+                        except httpx.HTTPError as error:
+                            last_transport_error = type(error).__name__
+            except TimeoutError:
+                last_transport_error = "total_timeout"
+                if acknowledged_status is None:
+                    last_status = None
             await self.repository.finish_attempt(
                 delivery.delivery_id,
                 delivery.lease_token,

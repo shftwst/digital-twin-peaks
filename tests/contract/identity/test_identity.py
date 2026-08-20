@@ -1,5 +1,6 @@
 # ruff: noqa: S105, S106
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
@@ -8,25 +9,58 @@ import jwt
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_twins.common.canonical import sha256_hex
-from enterprise_twins.common.control.contracts import FaultDecision, ParticipantLoadRequest
+from enterprise_twins.common.control.contracts import (
+    ClockValue,
+    FaultDecision,
+    ParticipantLoadRequest,
+)
 from enterprise_twins.common.control.participant import ResetParticipant
 from enterprise_twins.common.db.records import AuditRecord, OutboxRecord, ScenarioState
+from enterprise_twins.common.events.contracts import (
+    WebhookSubscriptionCreate,
+    WebhookSubscriptionCreated,
+)
 from enterprise_twins.common.events.relay_client import RelayClient
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.identity import repository as repository_module
 from enterprise_twins.services.identity.app import IdentityStatus, create_identity_app
+from enterprise_twins.services.identity.issuer import TokenIssuer
 from enterprise_twins.services.identity.models import IdentityClient
+from enterprise_twins.services.identity.repository import IdentityRepository
 from enterprise_twins.services.identity.scenario import IdentityScenarioLoader
 from enterprise_twins.services.identity.secrets import digest_secret
 from enterprise_twins.services.identity.secrets import secret_matches as real_secret_matches
 from enterprise_twins.services.identity.settings import IdentitySettings
 
 
+async def wait_for_lock_waiters(
+    db: async_sessionmaker[AsyncSession],
+    expected: int,
+    tasks: list[asyncio.Task[object]],
+) -> bool:
+    for _ in range(100):
+        async with db() as session:
+            waiters = await session.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                )
+            )
+        if waiters is not None and waiters >= expected:
+            return True
+        if any(task.done() for task in tasks):
+            return False
+    return False
+
+
 class Clock:
+    async def snapshot(self) -> ClockValue:
+        return ClockValue(now=datetime(2026, 8, 19, 10, tzinfo=UTC), scenarioEpoch="epoch_1")
+
     async def now(self) -> datetime:
         return datetime(2026, 8, 19, 10, tzinfo=UTC)
 
@@ -48,6 +82,61 @@ class UnavailableControl(Clock):
             status_code=503,
             retryable=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_token_issue_uses_one_atomic_control_snapshot(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    snapshot_time = datetime(2026, 8, 19, 10, 5, tzinfo=UTC)
+
+    class SplitControl(Clock):
+        async def snapshot(self) -> ClockValue:
+            return ClockValue(now=snapshot_time, scenarioEpoch="epoch_1")
+
+        async def now(self) -> datetime:
+            return datetime(2026, 8, 18, 9, tzinfo=UTC)
+
+    settings = IdentitySettings(
+        database_url="postgresql+asyncpg://unused",
+        issuer="http://identity:8000",
+        audience="enterprise-twins",
+        signing_seed="identity-test-signing-seed",
+        secret_pepper="identity-test-pepper",
+        token_ttl_seconds=600,
+    )
+    async with db.begin() as session:
+        session.add(ScenarioState(singleton_id=1, mode="active", active_epoch="epoch_1"))
+        session.add(
+            IdentityClient(
+                row_id="irow_atomic_snapshot",
+                scenario_epoch="epoch_1",
+                client_id="atomic-client",
+                secret_digest=digest_secret(
+                    "atomic-client", "atomic-secret", settings.secret_pepper
+                ),
+                subject="atomic-subject",
+                actor_type="service",
+                role="crm_service",
+                scopes=["crm:read"],
+                tenant_id="tenant_synthetic",
+                active=True,
+                version=1,
+            )
+        )
+    issuer = TokenIssuer(
+        settings.issuer,
+        settings.audience,
+        settings.signing_seed,
+        settings.token_ttl_seconds,
+    )
+    repository = IdentityRepository(db, settings, issuer, SplitControl())
+
+    result = await repository.authenticate("atomic-client", "atomic-secret", ["crm:read"])
+    claims = jwt.decode(result.access_token, options={"verify_signature": False})
+
+    assert claims["iat"] == int(snapshot_time.timestamp())
+    assert claims["scenario_epoch"] == "epoch_1"
 
 
 @pytest_asyncio.fixture
@@ -298,6 +387,109 @@ async def test_webhook_delete_rejects_noncanonical_if_match_before_relay_work(
 
 
 @pytest.mark.asyncio
+async def test_identity_webhook_proxy_holds_the_local_epoch_fence_through_relay_call(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = IdentitySettings(
+        database_url="postgresql+asyncpg://unused",
+        issuer="http://identity:8000",
+        audience="enterprise-twins",
+        signing_seed="identity-test-signing-seed",
+        secret_pepper="identity-test-pepper",
+        token_ttl_seconds=600,
+    )
+    async with db.begin() as session:
+        session.add(ScenarioState(singleton_id=1, mode="active", active_epoch="epoch_1"))
+        session.add(
+            IdentityClient(
+                row_id="irow_proxy_fence",
+                scenario_epoch="epoch_1",
+                client_id="proxy-manager",
+                secret_digest=digest_secret(
+                    "proxy-manager", "proxy-secret", settings.secret_pepper
+                ),
+                subject="person-support-1",
+                actor_type="human",
+                role="support_agent",
+                scopes=["webhooks:manage"],
+                tenant_id="tenant_synthetic",
+                active=True,
+                version=1,
+            )
+        )
+    relay_entered = asyncio.Event()
+    release_relay = asyncio.Event()
+    order: list[str] = []
+
+    class BarrierRelay:
+        async def create_subscription(
+            self,
+            _caller_id: str,
+            _idempotency_key: str,
+            request: WebhookSubscriptionCreate,
+        ) -> WebhookSubscriptionCreated:
+            relay_entered.set()
+            await release_relay.wait()
+            order.append("relay")
+            return WebhookSubscriptionCreated(
+                subscriptionId="sub_proxy",
+                source="identity",
+                eventTypes=request.event_types,
+                targetUrl=request.target_url,
+                version=1,
+                secret="proxy-signing-secret",
+            )
+
+    participant = ResetParticipant(
+        db,
+        IdentityScenarioLoader(settings.secret_pepper),
+        service="identity",
+    )
+    app = create_identity_app(db, settings, Clock(), BarrierRelay())  # type: ignore[arg-type]
+
+    async def run_prepare() -> None:
+        await participant.prepare("epoch_2")
+        order.append("reset")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://identity:8000"
+    ) as client:
+        token_response = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": "proxy-manager",
+                "client_secret": "proxy-secret",
+                "scope": "webhooks:manage",
+            },
+        )
+        token = token_response.json()["access_token"]
+        proxy_task = asyncio.create_task(
+            client.post(
+                "/v1/webhook-subscriptions",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Correlation-Id": "proxy-fence",
+                    "Idempotency-Key": "proxy-fence-key",
+                },
+                json={
+                    "eventTypes": ["identity.token.issued"],
+                    "targetUrl": "http://webhook-receiver/events",
+                },
+            )
+        )
+        await relay_entered.wait()
+        prepare_task = asyncio.create_task(run_prepare())
+        reset_was_fenced = await wait_for_lock_waiters(db, 1, [prepare_task])
+        release_relay.set()
+        response, _ = await asyncio.gather(proxy_task, prepare_task)
+
+    assert reset_was_fenced is True
+    assert response.status_code == 201
+    assert order == ["relay", "reset"]
+
+
+@pytest.mark.asyncio
 async def test_absent_client_and_wrong_secret_take_same_secret_check_and_are_audited(
     identity_client: AsyncClient,
     db: async_sessionmaker[AsyncSession],
@@ -453,3 +645,28 @@ async def test_identity_reset_loads_digested_clients_and_is_ready_only_when_acti
         settings.secret_pepper,
         clients[0].secret_digest,
     )
+
+
+@pytest.mark.asyncio
+async def test_identity_loader_rejects_an_unsupported_schema_before_staging(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    payload = {
+        "schemaVersion": "2",
+        "clients": [
+            {
+                "clientId": "unsupported-client",
+                "clientSecret": "unsupported-secret",
+                "subject": "unsupported-subject",
+                "actorType": "service",
+                "role": "crm_service",
+                "scopes": ["crm:read"],
+                "tenantId": "tenant_synthetic",
+            }
+        ],
+    }
+
+    async with db() as session:
+        with pytest.raises(ValueError, match="schemaVersion"):
+            await IdentityScenarioLoader("identity-test-pepper").load(session, "epoch_new", payload)
+        assert not session.new

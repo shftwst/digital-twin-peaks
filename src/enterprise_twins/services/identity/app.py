@@ -9,6 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_twins.common.auth.audit import DatabaseAuthDecisionRecorder
+from enterprise_twins.common.auth.scenario import ScenarioAccess
 from enterprise_twins.common.auth.verifier import BearerAuthenticator, JwtVerifier
 from enterprise_twins.common.control.client import ControlClient
 from enterprise_twins.common.db.records import ScenarioState
@@ -98,7 +99,16 @@ def create_identity_app(
         "Identity twin",
         ("tokens:issue", "webhooks:manage"),
         IdentityStatus(factory, control),
-        (identity_router(repository, issuer, settings, authenticator, relay),),
+        (
+            identity_router(
+                repository,
+                issuer,
+                settings,
+                authenticator,
+                relay,
+                ScenarioAccess("identity", factory),
+            ),
+        ),
         lifespan,
     )
 

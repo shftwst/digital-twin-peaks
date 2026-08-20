@@ -22,6 +22,7 @@ from enterprise_twins.common.events.contracts import (
     WebhookSubscriptionCreated,
     WebhookSubscriptionView,
 )
+from enterprise_twins.common.http.context import bind_response_epoch
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.common.ids import new_id
 from enterprise_twins.services.relay.models import (
@@ -45,6 +46,8 @@ class RelayRepository:
         state = await session.scalar(
             select(ScenarioState).where(ScenarioState.singleton_id == 1).with_for_update(read=True)
         )
+        if state is not None:
+            bind_response_epoch(state.active_epoch)
         if state is None or state.mode != "active":
             raise RuntimeError("relay scenario is not active")
         return state.active_epoch

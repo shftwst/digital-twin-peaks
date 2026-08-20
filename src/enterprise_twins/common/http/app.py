@@ -6,7 +6,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from enterprise_twins.common.http.context import RequestContextMiddleware, current_request
+from enterprise_twins.common.http.context import (
+    RequestContext,
+    RequestContextMiddleware,
+    current_request,
+)
 from enterprise_twins.common.http.errors import ApiError, ErrorBody, ErrorCode, ErrorEnvelope
 from enterprise_twins.common.http.health import RuntimeStatus, health_router
 from enterprise_twins.common.ids import new_id
@@ -26,9 +30,22 @@ def create_app(
     for router in routers:
         app.include_router(router)
 
-    @app.exception_handler(ApiError)
-    async def api_error(_request: Request, error: ApiError) -> JSONResponse:
+    def request_context(request: Request) -> RequestContext | None:
         context = current_request.get()
+        if context is not None:
+            return context
+        state_context = getattr(request.state, "request_context", None)
+        return state_context if isinstance(state_context, RequestContext) else None
+
+    async def response_epoch(request: Request) -> str:
+        context = request_context(request)
+        if context is not None and context.response_epoch is not None:
+            return context.response_epoch
+        return await status.current_epoch()
+
+    @app.exception_handler(ApiError)
+    async def api_error(request: Request, error: ApiError) -> JSONResponse:
+        context = request_context(request)
         request_id = context.request_id if context else new_id("req")
         body = ErrorEnvelope(
             error=ErrorBody(
@@ -41,12 +58,12 @@ def create_app(
         )
         response = JSONResponse(body.model_dump(mode="json"), status_code=error.status_code)
         response.headers["X-Request-Id"] = request_id
-        response.headers["X-Scenario-Epoch"] = await status.current_epoch()
+        response.headers["X-Scenario-Epoch"] = await response_epoch(request)
         return response
 
     @app.exception_handler(RequestValidationError)
-    async def invalid_request(_request: Request, error: RequestValidationError) -> JSONResponse:
-        context = current_request.get()
+    async def invalid_request(request: Request, error: RequestValidationError) -> JSONResponse:
+        context = request_context(request)
         request_id = context.request_id if context else new_id("req")
         try:
             validation_errors = error.errors(  # type: ignore[call-arg]
@@ -69,12 +86,12 @@ def create_app(
         )
         response = JSONResponse(body.model_dump(mode="json"), status_code=422)
         response.headers["X-Request-Id"] = request_id
-        response.headers["X-Scenario-Epoch"] = await status.current_epoch()
+        response.headers["X-Scenario-Epoch"] = await response_epoch(request)
         return response
 
     @app.exception_handler(StarletteHTTPException)
-    async def http_error(_request: Request, error: StarletteHTTPException) -> JSONResponse:
-        context = current_request.get()
+    async def http_error(request: Request, error: StarletteHTTPException) -> JSONResponse:
+        context = request_context(request)
         request_id = context.request_id if context else new_id("req")
         code_by_status = {
             400: ErrorCode.INVALID_REQUEST,
@@ -97,12 +114,12 @@ def create_app(
         )
         response = JSONResponse(body.model_dump(mode="json"), status_code=error.status_code)
         response.headers["X-Request-Id"] = request_id
-        response.headers["X-Scenario-Epoch"] = await status.current_epoch()
+        response.headers["X-Scenario-Epoch"] = await response_epoch(request)
         return response
 
     @app.exception_handler(Exception)
-    async def internal_error(_request: Request, _error: Exception) -> JSONResponse:
-        context = current_request.get()
+    async def internal_error(request: Request, _error: Exception) -> JSONResponse:
+        context = request_context(request)
         request_id = context.request_id if context else new_id("req")
         body = ErrorEnvelope(
             error=ErrorBody(
@@ -113,7 +130,7 @@ def create_app(
         )
         response = JSONResponse(body.model_dump(mode="json"), status_code=500)
         response.headers["X-Request-Id"] = request_id
-        response.headers["X-Scenario-Epoch"] = await status.current_epoch()
+        response.headers["X-Scenario-Epoch"] = await response_epoch(request)
         return response
 
     return app
