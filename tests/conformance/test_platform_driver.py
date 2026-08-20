@@ -10,6 +10,12 @@ from enterprise_twins.conformance.platform_contracts import (
     publish_latest,
     validate_network_evidence,
 )
+from enterprise_twins.topology import (
+    endpoint_manifest_compose_evidence,
+    endpoint_manifest_runtime_evidence,
+)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 REQUIRED_SUCCESS_OPERATIONS = {
     "control.reset",
@@ -965,7 +971,7 @@ def valid_network_evidence() -> dict[str, object]:
                     "--crm-loopback-url",
                     "http://127.0.0.1:8102",
                 ],
-                "credentialEnvironmentKeys": [],
+                "unapprovedEnvironmentKeys": [],
                 "exitCode": 0,
                 "hostBindings": {},
                 "networkAttachments": [],
@@ -978,6 +984,130 @@ def valid_network_evidence() -> dict[str, object]:
             },
         },
     }
+
+
+def endpoint_manifest_command() -> list[str]:
+    return [
+        "enterprise_twins.endpoint_manifest",
+        "--output",
+        "/output/manifest-v1.json",
+        "--identity-container-url",
+        "http://identity:8000",
+        "--identity-loopback-url",
+        "http://127.0.0.1:8101",
+        "--crm-container-url",
+        "http://crm:8000",
+        "--crm-loopback-url",
+        "http://127.0.0.1:8102",
+    ]
+
+
+def valid_endpoint_manifest_compose_service() -> dict[str, object]:
+    return {
+        "command": endpoint_manifest_command(),
+        "network_mode": "none",
+        "read_only": True,
+        "user": "0:0",
+        "volumes": [
+            {
+                "type": "bind",
+                "source": str(PROJECT_ROOT / "artifacts" / "endpoints"),
+                "target": "/output",
+            }
+        ],
+    }
+
+
+def valid_endpoint_manifest_inspection() -> dict[str, object]:
+    return {
+        "Config": {
+            "Cmd": endpoint_manifest_command(),
+            "Env": [
+                "PATH=/app/.venv/bin:/usr/local/bin:/usr/bin:/bin",
+                "PYTHON_VERSION=3.14.7",
+                "PYTHON_SHA256=public-build-hash",
+                "PYTHONUNBUFFERED=1",
+                "GPG_KEY=public-build-key",
+            ],
+            "User": "0:0",
+        },
+        "HostConfig": {
+            "NetworkMode": "none",
+            "PortBindings": {},
+            "ReadonlyRootfs": True,
+            "RestartPolicy": {"MaximumRetryCount": 0, "Name": "no"},
+        },
+        "Mounts": [
+            {
+                "Destination": "/output",
+                "RW": True,
+                "Source": str(PROJECT_ROOT / "artifacts" / "endpoints"),
+                "Type": "bind",
+            }
+        ],
+        "NetworkSettings": {"Networks": {"none": {}}},
+        "State": {"ExitCode": 0, "Status": "exited"},
+    }
+
+
+@pytest.mark.parametrize("extra_environment", ["API_KEY=private-marker", "EXTRA_SETTING=1"])
+def test_endpoint_manifest_runtime_rejects_every_unapproved_environment_key(
+    extra_environment: str,
+) -> None:
+    inspected = valid_endpoint_manifest_inspection()
+    environment = inspected["Config"]
+    assert isinstance(environment, dict)
+    values = environment["Env"]
+    assert isinstance(values, list)
+    values.append(extra_environment)
+
+    with pytest.raises(AssertionError, match="environment"):
+        endpoint_manifest_runtime_evidence(inspected)
+
+
+def test_endpoint_manifest_compose_rejects_a_suffix_matching_source_from_another_project() -> None:
+    service = valid_endpoint_manifest_compose_service()
+    volumes = service["volumes"]
+    assert isinstance(volumes, list)
+    volume = volumes[0]
+    assert isinstance(volume, dict)
+    volume["source"] = str(PROJECT_ROOT.parent / "other-project" / "artifacts" / "endpoints")
+
+    with pytest.raises(AssertionError, match="output mount"):
+        endpoint_manifest_compose_evidence(service)
+
+
+def test_endpoint_manifest_runtime_rejects_a_suffix_matching_source_from_another_project() -> None:
+    inspected = valid_endpoint_manifest_inspection()
+    mounts = inspected["Mounts"]
+    assert isinstance(mounts, list)
+    mount = mounts[0]
+    assert isinstance(mount, dict)
+    mount["Source"] = str(PROJECT_ROOT.parent / "other-project" / "artifacts" / "endpoints")
+
+    with pytest.raises(AssertionError, match="output mount"):
+        endpoint_manifest_runtime_evidence(inspected)
+
+
+def test_endpoint_manifest_sources_cannot_move_together_to_another_project() -> None:
+    service = valid_endpoint_manifest_compose_service()
+    volumes = service["volumes"]
+    assert isinstance(volumes, list)
+    volume = volumes[0]
+    assert isinstance(volume, dict)
+    wrong_source = str(PROJECT_ROOT.parent / "joint-mutation" / "artifacts" / "endpoints")
+    volume["source"] = wrong_source
+    inspected = valid_endpoint_manifest_inspection()
+    mounts = inspected["Mounts"]
+    assert isinstance(mounts, list)
+    mount = mounts[0]
+    assert isinstance(mount, dict)
+    mount["Source"] = wrong_source
+
+    with pytest.raises(AssertionError, match="output mount"):
+        endpoint_manifest_compose_evidence(service)
+    with pytest.raises(AssertionError, match="output mount"):
+        endpoint_manifest_runtime_evidence(inspected)
 
 
 def driver_for(root: Path, run_id: str) -> Driver:
@@ -1012,7 +1142,7 @@ def test_summary_accepts_exhaustive_canonical_network_evidence(tmp_path: Path) -
         ("compose", "restart", "on-failure"),
         ("runtime", "networkMode", "default"),
         ("runtime", "networkAttachments", ["twin-control"]),
-        ("runtime", "credentialEnvironmentKeys", ["CONTROL_TOKEN"]),
+        ("runtime", "unapprovedEnvironmentKeys", ["CONTROL_TOKEN"]),
         (
             "runtime",
             "hostBindings",

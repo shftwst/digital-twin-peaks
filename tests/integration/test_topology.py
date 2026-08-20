@@ -278,7 +278,7 @@ def test_canonical_runtime_network_proof_is_exhaustive(tmp_path: Path) -> None:
                 "--crm-loopback-url",
                 "http://127.0.0.1:8102",
             ],
-            "credentialEnvironmentKeys": [],
+            "unapprovedEnvironmentKeys": [],
             "exitCode": 0,
             "hostBindings": {},
             "networkAttachments": [],

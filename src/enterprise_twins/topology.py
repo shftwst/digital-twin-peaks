@@ -67,6 +67,17 @@ PRIVATE_PROBE_TARGETS = {
 }
 
 WORKER_COMMAND = ["enterprise_twins.services.relay.delivery"]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ENDPOINT_MANIFEST_OUTPUT_DIRECTORY = (PROJECT_ROOT / "artifacts" / "endpoints").resolve()
+ENDPOINT_MANIFEST_RUNTIME_ENVIRONMENT_KEYS = frozenset(
+    {
+        "GPG_KEY",
+        "PATH",
+        "PYTHON_SHA256",
+        "PYTHON_VERSION",
+        "PYTHONUNBUFFERED",
+    }
+)
 ENDPOINT_MANIFEST_COMMAND = [
     "enterprise_twins.endpoint_manifest",
     "--output",
@@ -96,7 +107,7 @@ ENDPOINT_MANIFEST_COMPOSE_EVIDENCE: JsonObject = {
 }
 ENDPOINT_MANIFEST_RUNTIME_EVIDENCE: JsonObject = {
     "command": ENDPOINT_MANIFEST_COMMAND,
-    "credentialEnvironmentKeys": [],
+    "unapprovedEnvironmentKeys": [],
     "exitCode": 0,
     "hostBindings": {},
     "networkAttachments": [],
@@ -145,10 +156,11 @@ def _mapping_keys(value: object, description: str) -> list[str]:
     return sorted(_object(value, description))
 
 
-def _mount_source_is_endpoint_directory(source: object) -> bool:
+def _mount_source_is_project_endpoint_directory(source: object) -> bool:
     if not isinstance(source, str):
         return False
-    return Path(source).parts[-2:] == ("artifacts", "endpoints")
+    path = Path(source)
+    return path.is_absolute() and path.resolve() == ENDPOINT_MANIFEST_OUTPUT_DIRECTORY
 
 
 def endpoint_manifest_compose_evidence(service: Mapping[str, object]) -> JsonObject:
@@ -163,7 +175,7 @@ def endpoint_manifest_compose_evidence(service: Mapping[str, object]) -> JsonObj
         }
         for volume in volumes
     ]
-    if len(volumes) != 1 or not _mount_source_is_endpoint_directory(
+    if len(volumes) != 1 or not _mount_source_is_project_endpoint_directory(
         _object(volumes[0], "endpoint manifest volume").get("source")
     ):
         raise AssertionError("endpoint manifest output mount differs")
@@ -186,29 +198,25 @@ def endpoint_manifest_compose_evidence(service: Mapping[str, object]) -> JsonObj
     return evidence
 
 
-def _credential_environment_keys(environment: object) -> list[str]:
+def _unapproved_environment_keys(environment: object) -> list[str]:
     if not isinstance(environment, list) or not all(
         isinstance(value, str) for value in environment
     ):
         raise AssertionError("endpoint manifest runtime environment is invalid")
-    markers = (
-        "AUTHORIZATION",
-        "CREDENTIAL",
-        "DATABASE",
-        "PASSWORD",
-        "POSTGRES",
-        "SECRET",
-        "TOKEN",
-    )
-    return sorted(
-        value.partition("=")[0]
-        for value in environment
-        if any(marker in value.partition("=")[0].upper() for marker in markers)
-    )
+    keys: list[str] = []
+    for value in environment:
+        key, separator, _configured_value = value.partition("=")
+        if not separator or not key:
+            raise AssertionError("endpoint manifest runtime environment is invalid")
+        keys.append(key)
+    return sorted(set(keys) - ENDPOINT_MANIFEST_RUNTIME_ENVIRONMENT_KEYS)
 
 
 def endpoint_manifest_runtime_evidence(inspected: Mapping[str, object]) -> JsonObject:
     configuration = _object(inspected.get("Config"), "endpoint manifest runtime configuration")
+    unapproved_environment_keys = _unapproved_environment_keys(configuration.get("Env"))
+    if unapproved_environment_keys:
+        raise AssertionError("endpoint manifest runtime environment differs")
     host = _object(inspected.get("HostConfig"), "endpoint manifest runtime host configuration")
     network = _object(inspected.get("NetworkSettings"), "endpoint manifest network settings")
     networks = _object(network.get("Networks"), "endpoint manifest runtime networks")
@@ -224,14 +232,14 @@ def endpoint_manifest_runtime_evidence(inspected: Mapping[str, object]) -> JsonO
         }
         for mount in mounts_value
     ]
-    if len(mounts_value) != 1 or not _mount_source_is_endpoint_directory(
+    if len(mounts_value) != 1 or not _mount_source_is_project_endpoint_directory(
         _object(mounts_value[0], "endpoint manifest runtime mount").get("Source")
     ):
         raise AssertionError("endpoint manifest runtime output mount differs")
     restart = _object(host.get("RestartPolicy"), "endpoint manifest restart policy")
     evidence: JsonObject = {
         "command": configuration.get("Cmd"),
-        "credentialEnvironmentKeys": _credential_environment_keys(configuration.get("Env")),
+        "unapprovedEnvironmentKeys": unapproved_environment_keys,
         "exitCode": state.get("ExitCode"),
         "hostBindings": host.get("PortBindings") or {},
         "networkAttachments": sorted(name for name in networks if name != "none"),
