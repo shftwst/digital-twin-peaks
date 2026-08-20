@@ -237,3 +237,33 @@ async def test_readiness_handles_database_connection_failure() -> None:
     assert response.json()["status"] == "not_ready"
     assert response.headers["X-Request-Id"].startswith("req_")
     assert response.headers["X-Scenario-Epoch"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_rejects_active_state_with_inconsistent_pending_epoch(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with db.begin() as session:
+        session.add(
+            ScenarioState(
+                singleton_id=1,
+                mode="active",
+                active_epoch="epoch_1",
+                pending_epoch="epoch_unexpected",
+            )
+        )
+        session.add(VirtualClock(singleton_id=1, now=datetime(2026, 8, 19, 10, tzinfo=UTC)))
+    app = create_control_app(
+        db,
+        ControlSettings(
+            database_url="postgresql+asyncpg://unused",
+            controller_token="controller-test-token",  # noqa: S106
+            twin_token="twin-test-token",  # noqa: S106
+        ),
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://control") as client:
+        response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["scenario"] == "active"

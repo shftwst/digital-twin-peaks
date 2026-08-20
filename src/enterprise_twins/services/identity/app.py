@@ -16,6 +16,7 @@ from enterprise_twins.common.db.runtime import make_engine, make_session_factory
 from enterprise_twins.common.events.publisher import OutboxDispatcher
 from enterprise_twins.common.events.relay_client import RelayClient
 from enterprise_twins.common.http.app import create_app
+from enterprise_twins.common.http.errors import ApiError
 from enterprise_twins.services.identity.api import identity_router
 from enterprise_twins.services.identity.issuer import TokenIssuer
 from enterprise_twins.services.identity.repository import IdentityControl, IdentityRepository
@@ -23,8 +24,13 @@ from enterprise_twins.services.identity.settings import IdentitySettings
 
 
 class IdentityStatus:
-    def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        control: IdentityControl,
+    ) -> None:
         self.factory = factory
+        self.control = control
 
     async def state(self) -> ScenarioState:
         async with self.factory() as session:
@@ -46,7 +52,18 @@ class IdentityStatus:
             return False, {"database": "not_ready", "scenario": "unavailable"}
         except RuntimeError:
             return False, {"database": "not_ready", "scenario": "uninitialised"}
-        return state.mode == "active", {"database": "ready", "scenario": state.mode}
+        checks = {"database": "ready", "scenario": state.mode, "control": "not_ready"}
+        if state.mode != "active":
+            return False, checks
+        try:
+            control_epoch = await self.control.ready_epoch()
+        except ApiError, OSError, RuntimeError:
+            return False, checks
+        if control_epoch != state.active_epoch:
+            checks["control"] = "epoch_mismatch"
+            return False, checks
+        checks["control"] = "ready"
+        return True, checks
 
 
 def create_identity_app(
@@ -80,7 +97,7 @@ def create_identity_app(
     return create_app(
         "Identity twin",
         ("tokens:issue", "webhooks:manage"),
-        IdentityStatus(factory),
+        IdentityStatus(factory, control),
         (identity_router(repository, issuer, settings, authenticator, relay),),
         lifespan,
     )

@@ -10,9 +10,14 @@ import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from enterprise_twins.common.control.contracts import FaultDecision, FaultEffect
+from enterprise_twins.common.canonical import sha256_hex
+from enterprise_twins.common.control.contracts import (
+    FaultDecision,
+    FaultEffect,
+    ParticipantLoadRequest,
+)
 from enterprise_twins.common.control.participant import ResetParticipant
-from enterprise_twins.common.db.records import ScenarioState
+from enterprise_twins.common.db.records import IdempotencyRecord, ScenarioState
 from enterprise_twins.common.events.contracts import EventEnvelope, WebhookSubscriptionCreate
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.relay.delivery import WebhookWorker
@@ -105,6 +110,27 @@ async def create_subscription_and_event(
     item = event or source_event()
     assert await repository.ingest(item) is True
     return created.secret, item
+
+
+async def finish_empty_reset(participant: ResetParticipant, epoch: str) -> None:
+    payload = {
+        "schemaVersion": "1",
+        "subscriptions": [],
+        "expectedCounts": {"subscriptions": 0, "events": 0, "deliveries": 0, "attempts": 0},
+    }
+    await participant.load(
+        ParticipantLoadRequest(
+            scenarioEpoch=epoch,
+            scenarioId="platform-contracts",
+            scenarioVersion=1,
+            randomSeed=7,
+            payload=payload,
+            checksum=sha256_hex(payload),
+            manifestChecksum="b" * 64,
+        )
+    )
+    await participant.commit(epoch)
+    await participant.finalize(epoch)
 
 
 async def wait_for_lock_waiters(
@@ -291,6 +317,153 @@ async def test_concurrent_subscription_replays_one_original_secret_and_changed_d
             NOW,
         )
     assert conflict.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_reset_prepare_cannot_overtake_subscription_create_or_leave_replay_ghost(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db, epoch="epoch_old")
+    async with db.begin() as session:
+        await session.execute(
+            text(
+                "CREATE OR REPLACE FUNCTION gate_reset_create_subscription() "
+                "RETURNS trigger LANGUAGE plpgsql AS $$ "
+                "BEGIN PERFORM pg_advisory_xact_lock(7201); RETURN NEW; END; $$"
+            )
+        )
+        await session.execute(
+            text(
+                "CREATE TRIGGER gate_reset_create_subscription "
+                "BEFORE INSERT ON idempotency_records FOR EACH ROW "
+                "EXECUTE FUNCTION gate_reset_create_subscription()"
+            )
+        )
+    participant = ResetParticipant(db, RelayScenarioLoader(), "relay")
+
+    async with advisory_gate(db, 7201):
+        creating = asyncio.create_task(
+            repository.create_subscription(
+                "crm", "caller-1", "reset-race-key", subscription_request(), NOW
+            )
+        )
+        await wait_for_lock_waiters(db, 1, [creating])
+        preparing = asyncio.create_task(participant.prepare("epoch_new"))
+        await wait_for_lock_waiters(db, 2, [creating, preparing])
+        assert preparing.done() is False
+    old_result = await creating
+    await preparing
+    await finish_empty_reset(participant, "epoch_new")
+
+    new_result = await repository.create_subscription(
+        "crm", "caller-1", "reset-race-key", subscription_request(), NOW
+    )
+
+    assert new_result.subscription_id != old_result.subscription_id
+    async with db() as session:
+        epochs = list(await session.scalars(select(Subscription.scenario_epoch)))
+        idempotency_epochs = list(await session.scalars(select(IdempotencyRecord.scenario_epoch)))
+    assert epochs == ["epoch_new"]
+    assert idempotency_epochs == ["epoch_new"]
+
+
+@pytest.mark.asyncio
+async def test_reset_prepare_cannot_overtake_event_ingest_or_leave_old_delivery_rows(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db, epoch="epoch_old")
+    await repository.create_subscription(
+        "crm", "caller-1", "setup-key", subscription_request(), NOW
+    )
+    async with db.begin() as session:
+        await session.execute(
+            text(
+                "CREATE OR REPLACE FUNCTION gate_reset_ingest() "
+                "RETURNS trigger LANGUAGE plpgsql AS $$ "
+                "BEGIN PERFORM pg_advisory_xact_lock(7202); RETURN NEW; END; $$"
+            )
+        )
+        await session.execute(
+            text(
+                "CREATE TRIGGER gate_reset_ingest BEFORE INSERT ON relay_source_events "
+                "FOR EACH ROW EXECUTE FUNCTION gate_reset_ingest()"
+            )
+        )
+    participant = ResetParticipant(db, RelayScenarioLoader(), "relay")
+
+    async with advisory_gate(db, 7202):
+        ingesting = asyncio.create_task(repository.ingest(source_event()))
+        await wait_for_lock_waiters(db, 1, [ingesting])
+        preparing = asyncio.create_task(participant.prepare("epoch_new"))
+        await wait_for_lock_waiters(db, 2, [ingesting, preparing])
+        assert preparing.done() is False
+    assert await ingesting is True
+    await preparing
+    await finish_empty_reset(participant, "epoch_new")
+
+    async with db() as session:
+        event_count = await session.scalar(select(func.count()).select_from(SourceEvent))
+        delivery_count = await session.scalar(select(func.count()).select_from(Delivery))
+        idempotency_count = await session.scalar(
+            select(func.count()).select_from(IdempotencyRecord)
+        )
+    assert event_count == 0
+    assert delivery_count == 0
+    assert idempotency_count == 0
+
+
+@pytest.mark.asyncio
+async def test_reset_prepare_cannot_overtake_subscription_delete_or_replay_old_success(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db, epoch="epoch_old")
+    created = await repository.create_subscription(
+        "crm", "caller-1", "setup-key", subscription_request(), NOW
+    )
+    async with db.begin() as session:
+        await session.execute(
+            text(
+                "CREATE OR REPLACE FUNCTION gate_reset_delete_subscription() "
+                "RETURNS trigger LANGUAGE plpgsql AS $$ "
+                "BEGIN PERFORM pg_advisory_xact_lock(7203); RETURN NEW; END; $$"
+            )
+        )
+        await session.execute(
+            text(
+                "CREATE TRIGGER gate_reset_delete_subscription "
+                "BEFORE INSERT ON idempotency_records FOR EACH ROW "
+                "EXECUTE FUNCTION gate_reset_delete_subscription()"
+            )
+        )
+    participant = ResetParticipant(db, RelayScenarioLoader(), "relay")
+
+    async with advisory_gate(db, 7203):
+        deleting = asyncio.create_task(
+            repository.delete_subscription(
+                "crm", "caller-1", "delete-race-key", created.subscription_id, 1
+            )
+        )
+        await wait_for_lock_waiters(db, 1, [deleting])
+        preparing = asyncio.create_task(participant.prepare("epoch_new"))
+        await wait_for_lock_waiters(db, 2, [deleting, preparing])
+        assert preparing.done() is False
+    await deleting
+    await preparing
+    await finish_empty_reset(participant, "epoch_new")
+
+    with pytest.raises(ApiError) as replay:
+        await repository.delete_subscription(
+            "crm", "caller-1", "delete-race-key", created.subscription_id, 1
+        )
+
+    assert replay.value.code == ErrorCode.NOT_FOUND
+    async with db() as session:
+        subscription_count = await session.scalar(select(func.count()).select_from(Subscription))
+        idempotency_count = await session.scalar(
+            select(func.count()).select_from(IdempotencyRecord)
+        )
+    assert subscription_count == 0
+    assert idempotency_count == 0
 
 
 @pytest.mark.asyncio

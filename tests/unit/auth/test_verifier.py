@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from enterprise_twins.common.auth.claims import Principal
-from enterprise_twins.common.auth.verifier import JwtVerifier
+from enterprise_twins.common.auth.verifier import BearerAuthenticator, JwtVerifier
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 
 NOW = datetime(2026, 8, 19, 10, tzinfo=UTC)
@@ -79,6 +79,41 @@ def token(
         algorithm="EdDSA",
         headers={"kid": kid},
     )
+
+
+class UnavailableVerifier:
+    async def verify(self, _token: str) -> Principal:
+        raise ApiError(
+            ErrorCode.TEMPORARILY_UNAVAILABLE,
+            "Control is temporarily unavailable",
+            status_code=503,
+            retryable=True,
+        )
+
+
+class Recorder:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def record(
+        self,
+        _principal: Principal | None,
+        _required_scopes: object,
+        _allowed: bool,
+    ) -> None:
+        self.calls += 1
+
+
+@pytest.mark.asyncio
+async def test_authenticator_does_not_record_dependency_outage_as_denial() -> None:
+    recorder = Recorder()
+    authenticator = BearerAuthenticator(UnavailableVerifier(), recorder)  # type: ignore[arg-type]
+
+    with pytest.raises(ApiError) as raised:
+        await authenticator.authenticate("Bearer token")
+
+    assert raised.value.code == ErrorCode.TEMPORARILY_UNAVAILABLE
+    assert recorder.calls == 0
 
 
 def test_principal_reports_exact_missing_scopes() -> None:

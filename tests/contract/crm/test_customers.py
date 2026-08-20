@@ -203,6 +203,23 @@ async def test_business_reads_stop_when_the_local_scenario_is_not_active(
 
 
 @pytest.mark.asyncio
+async def test_business_read_reports_control_outage_as_retryable_503(
+    crm_harness: object,
+) -> None:
+    harness = crm_harness
+    harness.control.available = False  # type: ignore[attr-defined]
+
+    response = await harness.client.get(  # type: ignore[attr-defined]
+        "/v1/customers/cus_unique",
+        headers=harness.support_headers,  # type: ignore[attr-defined]
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "temporarily_unavailable"
+    assert response.json()["error"]["retryable"] is True
+
+
+@pytest.mark.asyncio
 async def test_crm_reset_loads_the_new_epoch_and_discards_the_old_epoch_on_finalize(
     db: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -233,7 +250,12 @@ async def test_crm_reset_loads_the_new_epoch_and_discards_the_old_epoch_on_final
             )
         )
     participant = ResetParticipant(db, CrmScenarioLoader(), service="crm")
-    status = CrmStatus(db)
+
+    class ReadyControl:
+        async def ready_epoch(self) -> str:
+            return "epoch_new"
+
+    status = CrmStatus(db, ReadyControl())
     payload = {
         "schemaVersion": "1",
         "customers": [
@@ -280,7 +302,7 @@ async def test_crm_reset_loads_the_new_epoch_and_discards_the_old_epoch_on_final
     assert report.aliases == {"primaryCustomer": "cus_new"}
     assert await status.readiness() == (
         True,
-        {"database": "ready", "scenario": "active"},
+        {"database": "ready", "scenario": "active", "control": "ready"},
     )
     async with db() as session:
         state = await session.get(ScenarioState, 1)

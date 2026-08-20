@@ -16,6 +16,7 @@ from enterprise_twins.common.control.contracts import (
     FaultProbe,
 )
 from enterprise_twins.common.db.runtime import make_engine, make_session_factory
+from enterprise_twins.common.http.errors import ApiError
 from enterprise_twins.services.relay.repository import RelayRepository
 from enterprise_twins.services.relay.settings import RelaySettings
 
@@ -125,7 +126,7 @@ async def main() -> None:
             while True:
                 try:
                     processed = await worker.run_once()
-                except RuntimeError, httpx.HTTPError, SQLAlchemyError:
+                except ApiError, RuntimeError, httpx.HTTPError, SQLAlchemyError:
                     processed = 0
                 if processed == 0:
                     await asyncio.sleep(0.05)

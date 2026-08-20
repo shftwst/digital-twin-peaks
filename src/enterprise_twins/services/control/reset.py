@@ -53,6 +53,22 @@ class ScenarioBundle:
         )
 
 
+class ScenarioIdInvalidError(RuntimeError):
+    pass
+
+
+class ScenarioNotFoundError(RuntimeError):
+    pass
+
+
+class ScenarioVersionNotFoundError(RuntimeError):
+    pass
+
+
+class ScenarioBundleInvalidError(RuntimeError):
+    pass
+
+
 class ParticipantClient(Protocol):
     async def prepare(self, epoch: str) -> None:
         raise NotImplementedError
@@ -74,6 +90,7 @@ BundleLoader = Callable[[str, int], ScenarioBundle]
 BeginControl = Callable[[str, ScenarioBundle, int], Awaitable[None]]
 CommitControl = Callable[[str, ScenarioBundle, int], Awaitable[None]]
 FinalizeControl = Callable[[str], Awaitable[None]]
+PendingCleanup = Callable[[], Awaitable[str | None]]
 ResetFailurePhase = Literal["pre_cutover", "cleanup"]
 FailControl = Callable[[str, ResetFailurePhase], Awaitable[None]]
 
@@ -91,6 +108,7 @@ class ResetCoordinator:
         commit_control: CommitControl,
         fail_control: FailControl,
         finalize_control: FinalizeControl,
+        pending_cleanup: PendingCleanup,
     ) -> None:
         self.participants = participants
         self.load_bundle = load_bundle
@@ -98,6 +116,7 @@ class ResetCoordinator:
         self.commit_control = commit_control
         self.fail_control = fail_control
         self.finalize_control = finalize_control
+        self.pending_cleanup = pending_cleanup
         self.lock = asyncio.Lock()
         self.test_mode = "active"
 
@@ -117,10 +136,64 @@ class ResetCoordinator:
         async def finalize(_epoch: str) -> None:
             return None
 
-        return cls(participants, lambda _sid, _version: bundle, begin, commit, fail, finalize)
+        async def pending() -> str | None:
+            return None
+
+        return cls(
+            participants,
+            lambda _sid, _version: bundle,
+            begin,
+            commit,
+            fail,
+            finalize,
+            pending,
+        )
+
+    @staticmethod
+    def cleanup_unavailable() -> ApiError:
+        return ApiError(
+            ErrorCode.TEMPORARILY_UNAVAILABLE,
+            "reset cleanup is temporarily unavailable",
+            status_code=503,
+            retryable=True,
+            details={"phase": "cleanup"},
+        )
+
+    async def finalize_epoch(self, epoch: str) -> None:
+        cleanup_results = await asyncio.gather(
+            *(participant.finalize(epoch) for participant in self.participants.values()),
+            return_exceptions=True,
+        )
+        if any(isinstance(result, BaseException) for result in cleanup_results):
+            raise ResetCleanupError("participant reset cleanup failed")
+        await self.finalize_control(epoch)
+
+    async def mark_cleanup_failed(self, epoch: str) -> None:
+        try:
+            await self.fail_control(epoch, "cleanup")
+        except Exception:
+            return
+
+    async def recover_pending_cleanup_unlocked(self) -> bool:
+        epoch = await self.pending_cleanup()
+        if epoch is None:
+            return False
+        try:
+            await self.finalize_epoch(epoch)
+        except Exception:
+            await self.mark_cleanup_failed(epoch)
+            self.test_mode = "cleanup_error"
+            raise self.cleanup_unavailable() from None
+        self.test_mode = "active"
+        return True
+
+    async def recover_pending_cleanup(self) -> bool:
+        async with self.lock:
+            return await self.recover_pending_cleanup_unlocked()
 
     async def reset(self, request: ResetRequest) -> ResetResult:
         async with self.lock:
+            await self.recover_pending_cleanup_unlocked()
             bundle = self.load_bundle(request.scenario_id, request.version)
             if set(self.participants) != set(bundle.payloads):
                 raise ValueError("participant services differ from scenario bundle services")
@@ -169,22 +242,11 @@ class ResetCoordinator:
                 self.test_mode = "error"
                 raise
             try:
-                cleanup_results = await asyncio.gather(
-                    *(participant.finalize(epoch) for participant in self.participants.values()),
-                    return_exceptions=True,
-                )
-                cleanup_errors = [
-                    result for result in cleanup_results if isinstance(result, BaseException)
-                ]
-                if cleanup_errors:
-                    raise ResetCleanupError(
-                        f"participant reset cleanup failed: {cleanup_errors[0]}"
-                    ) from cleanup_errors[0]
-                await self.finalize_control(epoch)
+                await self.finalize_epoch(epoch)
             except Exception:
-                await self.fail_control(epoch, "cleanup")
+                await self.mark_cleanup_failed(epoch)
                 self.test_mode = "cleanup_error"
-                raise
+                raise self.cleanup_unavailable() from None
             self.test_mode = "active"
             return ResetResult(
                 scenarioId=bundle.scenario_id,
@@ -240,25 +302,59 @@ class DirectoryBundleLoader:
 
     def __call__(self, scenario_id: str, version: int) -> ScenarioBundle:
         if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", scenario_id) is None:
-            raise ValueError("scenario ID has invalid characters")
+            raise ScenarioIdInvalidError("scenario ID has invalid characters")
         directory = (self.scenario_root / scenario_id).resolve()
         if not directory.is_relative_to(self.scenario_root):
-            raise ValueError("scenario path escapes the configured root")
-        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-        if manifest["scenarioId"] != scenario_id or manifest["version"] != version:
-            raise ValueError("scenario manifest ID or version differs")
-        payloads: dict[str, dict[str, Any]] = {}
-        for service, item in manifest["services"].items():
-            filename = item["file"]
-            path = (directory / filename).resolve()
-            if not path.is_relative_to(directory):
-                raise ValueError(f"scenario file for {service} escapes its directory")
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if sha256_hex(payload) != item["checksum"]:
-                raise ValueError(f"scenario checksum differs for {service}")
-            payloads[service] = payload
-        initial = datetime.fromisoformat(manifest["initialTime"].replace("Z", "+00:00"))
-        return ScenarioBundle(scenario_id, version, initial, payloads)
+            raise ScenarioBundleInvalidError("scenario path escapes the configured root")
+        if not directory.is_dir():
+            raise ScenarioNotFoundError("scenario directory is absent")
+        try:
+            manifest_path = directory / "manifest.json"
+            if not manifest_path.is_file():
+                raise ScenarioBundleInvalidError("scenario manifest is absent")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ScenarioBundleInvalidError("scenario manifest is invalid")
+            if manifest.get("scenarioId") != scenario_id:
+                raise ScenarioBundleInvalidError("scenario manifest ID differs")
+            manifest_version = manifest.get("version")
+            if type(manifest_version) is not int:
+                raise ScenarioBundleInvalidError("scenario manifest version is invalid")
+            if manifest_version != version:
+                raise ScenarioVersionNotFoundError("scenario version is absent")
+            services = manifest.get("services")
+            if not isinstance(services, dict):
+                raise ScenarioBundleInvalidError("scenario services are invalid")
+            payloads: dict[str, dict[str, Any]] = {}
+            for service, item in services.items():
+                if not isinstance(service, str) or not isinstance(item, dict):
+                    raise ScenarioBundleInvalidError("scenario service entry is invalid")
+                filename = item.get("file")
+                checksum = item.get("checksum")
+                if not isinstance(filename, str) or not isinstance(checksum, str):
+                    raise ScenarioBundleInvalidError("scenario service file is invalid")
+                path = (directory / filename).resolve()
+                if not path.is_relative_to(directory):
+                    raise ScenarioBundleInvalidError("scenario service path escapes its directory")
+                if not path.is_file():
+                    raise ScenarioBundleInvalidError("scenario service payload is absent")
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ScenarioBundleInvalidError("scenario service payload is invalid")
+                if sha256_hex(payload) != checksum:
+                    raise ScenarioBundleInvalidError("scenario service checksum differs")
+                payloads[service] = payload
+            initial_value = manifest.get("initialTime")
+            if not isinstance(initial_value, str):
+                raise ScenarioBundleInvalidError("scenario initial time is invalid")
+            initial = datetime.fromisoformat(initial_value.replace("Z", "+00:00"))
+            if initial.utcoffset() is None:
+                raise ScenarioBundleInvalidError("scenario initial time has no UTC offset")
+            return ScenarioBundle(scenario_id, version, initial, payloads)
+        except ScenarioBundleInvalidError, ScenarioVersionNotFoundError:
+            raise
+        except Exception as error:
+            raise ScenarioBundleInvalidError("scenario bundle is invalid") from error
 
 
 class ControlResetStore:
@@ -337,6 +433,18 @@ class ControlResetStore:
             run.state = "committed"
             run.error = None
 
+    async def pending_cleanup(self) -> str | None:
+        async with self.factory() as session:
+            state = await session.get(ScenarioState, 1)
+        if (
+            state is not None
+            and state.mode in {"finalizing", "error"}
+            and state.pending_epoch is not None
+            and state.active_epoch == state.pending_epoch
+        ):
+            return state.pending_epoch
+        return None
+
     async def fail(self, epoch: str, phase: ResetFailurePhase) -> None:
         async with self.factory.begin() as session:
             state = await session.get(ScenarioState, 1, with_for_update=True)
@@ -372,7 +480,26 @@ def reset_router(
 
     @router.post("/control/v1/reset")
     async def reset(request: ResetRequest, _auth: ControllerAuth) -> ResetResult:
-        return await coordinator.reset(request)
+        try:
+            return await coordinator.reset(request)
+        except ScenarioIdInvalidError as error:
+            raise ApiError(
+                ErrorCode.INVALID_REQUEST,
+                "scenario ID is invalid",
+                status_code=422,
+            ) from error
+        except ScenarioNotFoundError as error:
+            raise ApiError(
+                ErrorCode.NOT_FOUND,
+                "scenario was not found",
+                status_code=404,
+            ) from error
+        except ScenarioVersionNotFoundError as error:
+            raise ApiError(
+                ErrorCode.NOT_FOUND,
+                "scenario version was not found",
+                status_code=404,
+            ) from error
 
     @router.get("/control/v1/status")
     async def status(_auth: ControllerAuth) -> dict[str, object]:
@@ -384,6 +511,12 @@ def reset_router(
             "scenarioEpoch": state.active_epoch,
             "manifestChecksum": state.manifest_checksum,
             "mode": state.mode,
+            "pendingEpoch": state.pending_epoch,
+            "recoveryRequired": (
+                state.mode in {"finalizing", "error"}
+                and state.pending_epoch is not None
+                and state.active_epoch == state.pending_epoch
+            ),
             "now": await repository.now(),
         }
 

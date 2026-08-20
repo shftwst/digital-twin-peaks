@@ -96,7 +96,11 @@ class FaultDecision(BaseModel):
 
 class ResetRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
-    scenario_id: str = Field(alias="scenarioId")
+    scenario_id: str = Field(
+        alias="scenarioId",
+        max_length=80,
+        pattern=r"^[a-z0-9][a-z0-9-]{0,79}$",
+    )
     version: int = Field(ge=1)
     random_seed: int | None = Field(
         default=None,

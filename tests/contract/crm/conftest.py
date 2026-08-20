@@ -14,6 +14,7 @@ from starlette.types import ASGIApp
 from enterprise_twins.common.auth.verifier import JwtVerifier
 from enterprise_twins.common.control.contracts import FaultDecision, FaultProbe
 from enterprise_twins.common.db.records import ScenarioState
+from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.crm.app import create_crm_app
 from enterprise_twins.services.crm.models import Customer, CustomerNote
 from enterprise_twins.services.crm.settings import CrmSettings
@@ -27,14 +28,31 @@ class Control:
     def __init__(self) -> None:
         self.epoch = "epoch_1"
         self.decision = FaultDecision()
+        self.available = True
+
+    def require_available(self) -> None:
+        if not self.available:
+            raise ApiError(
+                ErrorCode.TEMPORARILY_UNAVAILABLE,
+                "Control is temporarily unavailable",
+                status_code=503,
+                retryable=True,
+            )
 
     async def now(self) -> datetime:
+        self.require_available()
         return NOW
 
     async def current_epoch(self) -> str:
+        self.require_available()
+        return self.epoch
+
+    async def ready_epoch(self) -> str:
+        self.require_available()
         return self.epoch
 
     async def evaluate_fault(self, probe: FaultProbe) -> FaultDecision:
+        self.require_available()
         return self.decision
 
 

@@ -32,6 +32,9 @@ class Clock:
     async def current_epoch(self) -> str:
         return "epoch_1"
 
+    async def ready_epoch(self) -> str:
+        return "epoch_1"
+
     async def evaluate_fault(self, probe: object) -> FaultDecision:
         return FaultDecision()
 
@@ -80,7 +83,7 @@ def relay_app(
     return create_app(
         "Relay probe",
         (),
-        RelayStatus(db),
+        RelayStatus(db, Clock()),
         (relay_router(repository, Clock(), settings()),),  # type: ignore[arg-type]
     )
 
@@ -470,7 +473,7 @@ async def test_readiness_returns_503_when_the_database_query_fails(
     await initialise_relay(db)
     async with db.begin() as session:
         await session.execute(text("DROP TABLE scenario_state"))
-    app = create_app("Relay probe", (), RelayStatus(db))
+    app = create_app("Relay probe", (), RelayStatus(db, Clock()))
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://relay"
@@ -483,3 +486,46 @@ async def test_readiness_returns_503_when_the_database_query_fails(
         "checks": {"database": "not_ready", "scenario": "unavailable"},
     }
     assert response.headers["X-Scenario-Epoch"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_relay_business_call_reports_control_outage_as_retryable_503(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db)
+
+    class UnavailableClock(Clock):
+        async def now(self) -> datetime:
+            raise ApiError(
+                ErrorCode.TEMPORARILY_UNAVAILABLE,
+                "Control is temporarily unavailable",
+                status_code=503,
+                retryable=True,
+            )
+
+    control = UnavailableClock()
+    app = create_app(
+        "Relay probe",
+        (),
+        RelayStatus(db, control),
+        (relay_router(repository, control, settings()),),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://relay"
+    ) as client:
+        response = await client.post(
+            "/internal/v1/sources/crm/subscriptions",
+            headers={
+                "Authorization": "Bearer crm-source-secret",
+                "Idempotency-Key": "outage-key",
+                "X-Caller-Id": "person-support-1",
+            },
+            json={
+                "eventTypes": ["crm.note.created"],
+                "targetUrl": "http://webhook-receiver/events",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "temporarily_unavailable"
+    assert response.json()["error"]["retryable"] is True

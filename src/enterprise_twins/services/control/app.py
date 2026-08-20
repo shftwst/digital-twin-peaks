@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from enterprise_twins.common.control.contracts import ResetRequest
 from enterprise_twins.common.db.runtime import make_engine, make_session_factory
 from enterprise_twins.common.http.app import create_app
+from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.control.api import control_router
 from enterprise_twins.services.control.faults import FaultRepository, fault_router
 from enterprise_twins.services.control.repository import (
@@ -43,7 +44,7 @@ class ControlStatus:
             await self.repository.now()
         except (OSError, RuntimeError, SQLAlchemyError):  # fmt: skip
             return False, {"database": "not_ready", "clock": "not_ready"}
-        ready = state.mode == "active"
+        ready = state.mode == "active" and state.pending_epoch is None
         return ready, {"database": "ready", "clock": "ready", "scenario": state.mode}
 
 
@@ -56,19 +57,33 @@ async def bootstrap_scenario(
     retry_delay_seconds: float = 0.25,
 ) -> None:
     try:
-        await repository.state()
+        state = await repository.state()
     except ScenarioStateMissingError:
-        pass
-    else:
-        return
+        state = None
+    if state is not None:
+        recovery_required = (
+            state.mode in {"finalizing", "error"}
+            and state.pending_epoch is not None
+            and state.active_epoch == state.pending_epoch
+        )
+        if not recovery_required:
+            return
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
     while True:
         try:
-            await coordinator.reset(request)
+            if state is None:
+                await coordinator.reset(request)
+            else:
+                await coordinator.recover_pending_cleanup()
             return
-        except httpx.TransportError:
+        except (ApiError, httpx.TransportError) as error:
+            if isinstance(error, ApiError) and not (
+                error.code == ErrorCode.TEMPORARILY_UNAVAILABLE
+                and error.details.get("phase") == "cleanup"
+            ):
+                raise
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise
@@ -126,6 +141,7 @@ def create_from_env() -> FastAPI:
         store.commit,
         store.fail,
         store.finalize,
+        store.pending_cleanup,
     )
 
     @asynccontextmanager

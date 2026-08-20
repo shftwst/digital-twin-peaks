@@ -12,6 +12,7 @@ from enterprise_twins.common.control.contracts import (
     FaultRuleCreate,
 )
 from enterprise_twins.common.db.records import ScenarioState
+from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.common.ids import new_id
 from enterprise_twins.services.control.models import FaultActivation, FaultRule, VirtualClock
 from enterprise_twins.services.control.settings import ControlSettings
@@ -34,6 +35,12 @@ class FaultRepository:
             state = await self.lock_state(session)
             if state is None or state.mode != "active":
                 raise RuntimeError("scenario is not active")
+            if await session.get(FaultRule, request.rule_id) is not None:
+                raise ApiError(
+                    ErrorCode.CONFLICT,
+                    "fault rule ID already exists",
+                    status_code=409,
+                )
             session.add(
                 FaultRule(
                     rule_id=request.rule_id,

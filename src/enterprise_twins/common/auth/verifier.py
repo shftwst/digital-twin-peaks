@@ -198,8 +198,8 @@ class BearerAuthenticator:
             )
         try:
             principal = await self.verifier.verify(authorization.removeprefix("Bearer "))
-        except ApiError:
-            if self.recorder is not None:
+        except ApiError as error:
+            if self.recorder is not None and error.code == ErrorCode.UNAUTHENTICATED:
                 await self.recorder.record(None, (), False)
             raise
         if self.recorder is not None:

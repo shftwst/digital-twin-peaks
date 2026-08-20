@@ -8,15 +8,23 @@ from enterprise_twins.common.control.contracts import (
     ParticipantReport,
     ResetRequest,
 )
+from enterprise_twins.common.http.errors import ApiError
 from enterprise_twins.services.control.reset import ResetCoordinator, ScenarioBundle, derive_seed
 
 
 class Participant:
-    def __init__(self, name: str, fail_on: str | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        fail_on: str | None = None,
+        *,
+        finalize_failures: int = 0,
+    ) -> None:
         self.name = name
         self.fail_on = fail_on
         self.calls: list[tuple[str, str]] = []
         self.active_epoch = "epoch_old"
+        self.finalize_failures = finalize_failures
 
     async def prepare(self, epoch: str) -> None:
         self.calls.append(("prepare", epoch))
@@ -45,6 +53,9 @@ class Participant:
 
     async def finalize(self, epoch: str) -> None:
         self.calls.append(("finalize", epoch))
+        if self.finalize_failures:
+            self.finalize_failures -= 1
+            raise RuntimeError(f"{self.name} finalize failed")
         if self.fail_on == "finalize":
             raise RuntimeError(f"{self.name} finalize failed")
 
@@ -124,9 +135,12 @@ async def test_finalize_failure_keeps_every_participant_on_the_new_epoch_without
     )
     coordinator = ResetCoordinator.for_test({"identity": identity, "crm": crm}, bundle)
 
-    with pytest.raises(RuntimeError, match="finalize failed"):
+    with pytest.raises(ApiError) as raised:
         await coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
 
+    assert raised.value.status_code == 503
+    assert raised.value.retryable is True
+    assert raised.value.details == {"phase": "cleanup"}
     assert identity.active_epoch == crm.active_epoch
     assert identity.active_epoch != "epoch_old"
     assert all(action != "abort" for action, _epoch in identity.calls)
@@ -190,3 +204,168 @@ def test_explicit_seed_is_limited_to_non_negative_postgresql_bigint() -> None:
         ResetRequest(scenarioId="platform-contracts", version=1, randomSeed=-1)
     with pytest.raises(ValidationError):
         ResetRequest(scenarioId="platform-contracts", version=1, randomSeed=maximum + 1)
+
+
+@pytest.mark.parametrize(
+    "scenario_id",
+    ["../escape", "UPPER", "-leading", "x" * 81, ""],
+)
+def test_reset_request_rejects_scenario_ids_outside_catalogue_key_contract(
+    scenario_id: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        ResetRequest(scenarioId=scenario_id, version=1)
+
+
+@pytest.mark.asyncio
+async def test_next_reset_recovers_persisted_cleanup_before_starting_new_epoch() -> None:
+    identity = Participant("identity", finalize_failures=1)
+    crm = Participant("crm")
+    bundle = ScenarioBundle(
+        scenario_id="platform-contracts",
+        version=1,
+        initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
+        payloads={"identity": {"expectedCounts": {}}, "crm": {"expectedCounts": {}}},
+    )
+    pending_epoch: str | None = None
+
+    async def begin(_epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
+        return None
+
+    async def commit(epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
+        nonlocal pending_epoch
+        pending_epoch = epoch
+
+    async def fail(_epoch: str, _phase: str) -> None:
+        return None
+
+    async def finalize(epoch: str) -> None:
+        nonlocal pending_epoch
+        assert pending_epoch == epoch
+        pending_epoch = None
+
+    async def pending() -> str | None:
+        return pending_epoch
+
+    coordinator = ResetCoordinator(
+        {"identity": identity, "crm": crm},
+        lambda _sid, _version: bundle,
+        begin,
+        commit,
+        fail,  # type: ignore[arg-type]
+        finalize,
+        pending,
+    )
+    request = ResetRequest(scenarioId="platform-contracts", version=1)
+
+    with pytest.raises(ApiError):
+        await coordinator.reset(request)
+    failed_epoch = pending_epoch
+    assert failed_epoch is not None
+
+    result = await coordinator.reset(request)
+
+    assert result.scenario_epoch != failed_epoch
+    assert pending_epoch is None
+    assert identity.calls.count(("finalize", failed_epoch)) == 2
+    assert crm.calls.count(("finalize", failed_epoch)) == 2
+    second_prepare = identity.calls.index(("prepare", result.scenario_epoch))
+    recovered_finalize = identity.calls.index(("finalize", failed_epoch), 4)
+    assert recovered_finalize < second_prepare
+
+
+@pytest.mark.asyncio
+async def test_repeated_cleanup_recovery_failure_retains_epoch_and_does_not_begin_new_reset() -> (
+    None
+):
+    identity = Participant("identity", fail_on="finalize")
+    bundle = ScenarioBundle(
+        scenario_id="platform-contracts",
+        version=1,
+        initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
+        payloads={"identity": {"expectedCounts": {}}},
+    )
+    pending_epoch: str | None = None
+    begin_calls = 0
+
+    async def begin(_epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
+        nonlocal begin_calls
+        begin_calls += 1
+
+    async def commit(epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
+        nonlocal pending_epoch
+        pending_epoch = epoch
+
+    async def fail(_epoch: str, _phase: str) -> None:
+        return None
+
+    async def finalize(_epoch: str) -> None:
+        raise AssertionError("Control must not finalize while a participant still fails")
+
+    async def pending() -> str | None:
+        return pending_epoch
+
+    coordinator = ResetCoordinator(
+        {"identity": identity},
+        lambda _sid, _version: bundle,
+        begin,
+        commit,
+        fail,  # type: ignore[arg-type]
+        finalize,
+        pending,
+    )
+    request = ResetRequest(scenarioId="platform-contracts", version=1)
+
+    with pytest.raises(ApiError):
+        await coordinator.reset(request)
+    failed_epoch = pending_epoch
+    with pytest.raises(ApiError) as retry:
+        await coordinator.reset(request)
+
+    assert retry.value.status_code == 503
+    assert pending_epoch == failed_epoch
+    assert begin_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cleanup_response_stays_retryable_when_failure_marker_cannot_be_updated() -> None:
+    identity = Participant("identity", fail_on="finalize")
+    bundle = ScenarioBundle(
+        scenario_id="platform-contracts",
+        version=1,
+        initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
+        payloads={"identity": {"expectedCounts": {}}},
+    )
+
+    async def begin(_epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
+        return None
+
+    async def commit(_epoch: str, _bundle: ScenarioBundle, _seed: int) -> None:
+        return None
+
+    async def fail(_epoch: str, _phase: str) -> None:
+        raise RuntimeError("sensitive database failure")
+
+    async def finalize(_epoch: str) -> None:
+        return None
+
+    async def pending() -> str | None:
+        return None
+
+    coordinator = ResetCoordinator(
+        {"identity": identity},
+        lambda _sid, _version: bundle,
+        begin,
+        commit,
+        fail,  # type: ignore[arg-type]
+        finalize,
+        pending,
+    )
+
+    with pytest.raises(ApiError) as raised:
+        await coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+
+    assert raised.value.status_code == 503
+    assert raised.value.retryable is True
+    assert raised.value.details == {"phase": "cleanup"}
+    assert "sensitive" not in str(raised.value)

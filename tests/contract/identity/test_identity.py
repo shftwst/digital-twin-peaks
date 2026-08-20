@@ -16,6 +16,7 @@ from enterprise_twins.common.control.contracts import FaultDecision, Participant
 from enterprise_twins.common.control.participant import ResetParticipant
 from enterprise_twins.common.db.records import AuditRecord, OutboxRecord, ScenarioState
 from enterprise_twins.common.events.relay_client import RelayClient
+from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.identity import repository as repository_module
 from enterprise_twins.services.identity.app import IdentityStatus, create_identity_app
 from enterprise_twins.services.identity.models import IdentityClient
@@ -32,8 +33,21 @@ class Clock:
     async def current_epoch(self) -> str:
         return "epoch_1"
 
+    async def ready_epoch(self) -> str:
+        return "epoch_1"
+
     async def evaluate_fault(self, probe: object) -> FaultDecision:
         return FaultDecision()
+
+
+class UnavailableControl(Clock):
+    async def evaluate_fault(self, probe: object) -> FaultDecision:
+        raise ApiError(
+            ErrorCode.TEMPORARILY_UNAVAILABLE,
+            "Control is temporarily unavailable",
+            status_code=503,
+            retryable=True,
+        )
 
 
 @pytest_asyncio.fixture
@@ -179,6 +193,39 @@ async def test_wrong_secret_and_ungranted_scope_are_denied(
     assert excessive.status_code == 403
     assert "wrong" not in wrong.text
     assert "support-secret" not in excessive.text
+
+
+@pytest.mark.asyncio
+async def test_token_business_call_reports_control_outage_as_retryable_503(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = IdentitySettings(
+        database_url="postgresql+asyncpg://unused",
+        issuer="http://identity:8000",
+        audience="enterprise-twins",
+        signing_seed="identity-test-signing-seed",
+        secret_pepper="identity-test-pepper",
+    )
+    async with db.begin() as session:
+        session.add(ScenarioState(singleton_id=1, mode="active", active_epoch="epoch_1"))
+    app = create_identity_app(db, settings, UnavailableControl())
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://identity:8000"
+    ) as client:
+        response = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": "support-agent",
+                "client_secret": "sensitive-secret",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "temporarily_unavailable"
+    assert response.json()["error"]["retryable"] is True
+    assert "sensitive-secret" not in response.text
 
 
 @pytest.mark.asyncio
@@ -341,7 +388,12 @@ async def test_identity_reset_loads_digested_clients_and_is_ready_only_when_acti
         IdentityScenarioLoader(settings.secret_pepper),
         service="identity",
     )
-    status = IdentityStatus(db)
+
+    class ReadyControl:
+        async def ready_epoch(self) -> str:
+            return "epoch_new"
+
+    status = IdentityStatus(db, ReadyControl())
     payload = {
         "schemaVersion": "1",
         "clients": [
@@ -370,7 +422,7 @@ async def test_identity_reset_loads_digested_clients_and_is_ready_only_when_acti
     await participant.prepare("epoch_new")
     assert await status.readiness() == (
         False,
-        {"database": "ready", "scenario": "preparing"},
+        {"database": "ready", "scenario": "preparing", "control": "not_ready"},
     )
     report = await participant.load(request)
     await participant.commit("epoch_new")
@@ -382,7 +434,7 @@ async def test_identity_reset_loads_digested_clients_and_is_ready_only_when_acti
     assert report.aliases == {"crm": "new-client"}
     assert await status.readiness() == (
         True,
-        {"database": "ready", "scenario": "active"},
+        {"database": "ready", "scenario": "active", "control": "ready"},
     )
     async with db() as session:
         state = await session.get(ScenarioState, 1)

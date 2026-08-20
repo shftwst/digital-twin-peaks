@@ -10,14 +10,20 @@ from enterprise_twins.common.control.client import ControlClient
 from enterprise_twins.common.db.records import ScenarioState
 from enterprise_twins.common.db.runtime import make_engine, make_session_factory
 from enterprise_twins.common.http.app import create_app
+from enterprise_twins.common.http.errors import ApiError
 from enterprise_twins.services.relay.api import relay_router
 from enterprise_twins.services.relay.repository import RelayRepository
 from enterprise_twins.services.relay.settings import RelaySettings
 
 
 class RelayStatus:
-    def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        control: ControlClient,
+    ) -> None:
         self.factory = factory
+        self.control = control
 
     async def state(self) -> ScenarioState:
         async with self.factory() as session:
@@ -39,7 +45,18 @@ class RelayStatus:
             return False, {"database": "not_ready", "scenario": "unavailable"}
         except RuntimeError:
             return False, {"database": "not_ready", "scenario": "uninitialised"}
-        return state.mode == "active", {"database": "ready", "scenario": state.mode}
+        checks = {"database": "ready", "scenario": state.mode, "control": "not_ready"}
+        if state.mode != "active":
+            return False, checks
+        try:
+            control_epoch = await self.control.ready_epoch()
+        except ApiError, OSError, RuntimeError:
+            return False, checks
+        if control_epoch != state.active_epoch:
+            checks["control"] = "epoch_mismatch"
+            return False, checks
+        checks["control"] = "ready"
+        return True, checks
 
 
 def create_from_env() -> FastAPI:
@@ -61,7 +78,7 @@ def create_from_env() -> FastAPI:
     return create_app(
         "Event Relay integration API",
         (),
-        RelayStatus(factory),
+        RelayStatus(factory, control),
         (relay_router(repository, control, settings),),
         lifespan,
     )

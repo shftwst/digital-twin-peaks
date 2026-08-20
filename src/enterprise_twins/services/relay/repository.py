@@ -42,7 +42,9 @@ class RelayRepository:
         self.allowed_targets = allowed_targets
 
     async def active_epoch(self, session: AsyncSession) -> str:
-        state = await session.get(ScenarioState, 1)
+        state = await session.scalar(
+            select(ScenarioState).where(ScenarioState.singleton_id == 1).with_for_update(read=True)
+        )
         if state is None or state.mode != "active":
             raise RuntimeError("relay scenario is not active")
         return state.active_epoch

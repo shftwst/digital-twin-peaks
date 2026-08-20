@@ -4,7 +4,13 @@ from pathlib import Path
 import pytest
 
 from enterprise_twins.common.canonical import sha256_hex
-from enterprise_twins.services.control.reset import DirectoryBundleLoader
+from enterprise_twins.services.control.reset import (
+    DirectoryBundleLoader,
+    ScenarioBundleInvalidError,
+    ScenarioIdInvalidError,
+    ScenarioNotFoundError,
+    ScenarioVersionNotFoundError,
+)
 
 
 def write_bundle(root: Path) -> tuple[Path, dict[str, object]]:
@@ -37,7 +43,7 @@ def test_directory_loader_rejects_checksum_mismatch(tmp_path: Path) -> None:
     manifest["services"]["identity"]["checksum"] = "0" * 64  # type: ignore[index]
     (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="checksum differs for identity"):
+    with pytest.raises(ScenarioBundleInvalidError):
         DirectoryBundleLoader(tmp_path)("platform-contracts", 1)
 
 
@@ -47,11 +53,20 @@ def test_directory_loader_rejects_service_file_path_escape(tmp_path: Path) -> No
     manifest["services"]["identity"]["file"] = "../outside.json"  # type: ignore[index]
     (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="escapes its directory"):
+    with pytest.raises(ScenarioBundleInvalidError):
         DirectoryBundleLoader(tmp_path)("platform-contracts", 1)
 
 
 @pytest.mark.parametrize("scenario_id", ["../escape", "UPPER", "-leading"])
 def test_directory_loader_rejects_invalid_scenario_ids(tmp_path: Path, scenario_id: str) -> None:
-    with pytest.raises(ValueError, match="invalid characters"):
+    with pytest.raises(ScenarioIdInvalidError):
         DirectoryBundleLoader(tmp_path)(scenario_id, 1)
+
+
+def test_directory_loader_distinguishes_absent_scenario_and_version(tmp_path: Path) -> None:
+    with pytest.raises(ScenarioNotFoundError):
+        DirectoryBundleLoader(tmp_path)("missing-scenario", 1)
+
+    write_bundle(tmp_path)
+    with pytest.raises(ScenarioVersionNotFoundError):
+        DirectoryBundleLoader(tmp_path)("platform-contracts", 2)

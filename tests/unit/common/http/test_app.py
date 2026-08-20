@@ -31,6 +31,11 @@ async def oauth_probe() -> dict[str, str]:
     return {"status": "reachable"}
 
 
+@router.get("/v1/internal-failure")
+async def internal_failure() -> None:
+    raise RuntimeError("database password is sensitive-value")
+
+
 client = TestClient(create_app("probe", ("probe:read",), ReadyStatus(), (router,)))
 
 
@@ -81,3 +86,21 @@ def test_unknown_business_route_uses_error_envelope() -> None:
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
     assert response.json()["error"]["requestId"].startswith("req_")
+
+
+def test_unexpected_exception_uses_redacted_internal_error_envelope() -> None:
+    response = TestClient(client.app, raise_server_exceptions=False).get(
+        "/v1/internal-failure",
+        headers={"X-Correlation-Id": "case-internal"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"] == {
+        "code": "internal_error",
+        "message": "internal server error",
+        "retryable": False,
+        "requestId": response.headers["X-Request-Id"],
+        "details": {},
+    }
+    assert response.headers["X-Scenario-Epoch"] == "epoch_test"
+    assert "sensitive-value" not in response.text

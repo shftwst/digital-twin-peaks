@@ -100,4 +100,20 @@ def create_app(
         response.headers["X-Scenario-Epoch"] = await status.current_epoch()
         return response
 
+    @app.exception_handler(Exception)
+    async def internal_error(_request: Request, _error: Exception) -> JSONResponse:
+        context = current_request.get()
+        request_id = context.request_id if context else new_id("req")
+        body = ErrorEnvelope(
+            error=ErrorBody(
+                code=ErrorCode.INTERNAL_ERROR,
+                message="internal server error",
+                requestId=request_id,
+            )
+        )
+        response = JSONResponse(body.model_dump(mode="json"), status_code=500)
+        response.headers["X-Request-Id"] = request_id
+        response.headers["X-Scenario-Epoch"] = await status.current_epoch()
+        return response
+
     return app

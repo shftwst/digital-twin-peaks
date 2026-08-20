@@ -29,6 +29,9 @@ class IdentityControl(Protocol):
     async def current_epoch(self) -> str:
         raise NotImplementedError
 
+    async def ready_epoch(self) -> str:
+        raise NotImplementedError
+
     async def evaluate_fault(self, probe: FaultProbe) -> FaultDecision:
         raise NotImplementedError
 

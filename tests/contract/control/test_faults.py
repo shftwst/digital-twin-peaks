@@ -3,7 +3,7 @@ import json
 from datetime import UTC, datetime
 
 import pytest
-from httpx import ASGITransport, AsyncClient, HTTPStatusError, MockTransport, Request, Response
+from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -16,6 +16,7 @@ from enterprise_twins.common.control.contracts import (
     FaultRuleCreate,
 )
 from enterprise_twins.common.db.records import ScenarioState
+from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.control.app import create_control_app
 from enterprise_twins.services.control.faults import FaultRepository
 from enterprise_twins.services.control.models import FaultActivation, FaultRule, VirtualClock
@@ -144,6 +145,58 @@ async def test_rule_matches_then_fires_at_configured_occurrence_once(
     async with db() as session:
         count = await session.scalar(select(func.count()).select_from(FaultActivation))
     assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_rule_id_returns_conflict_without_changing_original(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    await initialise_control(db)
+    app = create_control_app(db, fault_settings())
+    original = fault_rule(delayMs=250).model_dump(mode="json", by_alias=True)
+    changed = fault_rule(delayMs=999).model_dump(mode="json", by_alias=True)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://control") as client:
+        created = await client.post(
+            "/control/v1/faults",
+            headers={"Authorization": "Bearer controller-secret-token"},
+            json=original,
+        )
+        duplicate = await client.post(
+            "/control/v1/faults",
+            headers={"Authorization": "Bearer controller-secret-token"},
+            json=changed,
+        )
+
+    assert created.status_code == 201
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"]["code"] == "conflict"
+    async with db() as session:
+        stored = await session.get(FaultRule, "crm-note-after-commit")
+    assert stored is not None
+    assert stored.delay_ms == 250
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_rule_creates_return_one_conflict(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    await initialise_control(db)
+    repository = FaultRepository(db)
+
+    results = await asyncio.gather(
+        repository.create(fault_rule(delayMs=250)),
+        repository.create(fault_rule(delayMs=999)),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, FaultRuleCreate) for result in results) == 1
+    conflicts = [result for result in results if isinstance(result, ApiError)]
+    assert len(conflicts) == 1
+    assert conflicts[0].code == ErrorCode.CONFLICT
+    async with db() as session:
+        stored = await session.get(FaultRule, "crm-note-after-commit")
+    assert stored is not None
+    assert stored.delay_ms in {250, 999}
 
 
 @pytest.mark.asyncio
@@ -426,7 +479,7 @@ async def test_fault_routes_enforce_roles_redact_tokens_and_client_serializes_pr
             headers={"Authorization": "Bearer controller-secret-token"},
         )
         denied_client = ControlClient("http://control", "controller-secret-token", client)
-        with pytest.raises(HTTPStatusError):
+        with pytest.raises(ApiError) as denied_error:
             await denied_client.evaluate_fault(fault_probe())
 
     assert denied_create.status_code == 401
@@ -436,6 +489,8 @@ async def test_fault_routes_enforce_roles_redact_tokens_and_client_serializes_pr
     assert diagnostics.json()[0]["effect"] == FaultEffect.TIMEOUT
     assert denied_clear.status_code == 401
     assert cleared.status_code == 204
+    assert denied_error.value.code == ErrorCode.TEMPORARILY_UNAVAILABLE
+    assert denied_error.value.status_code == 503
     for response in (denied_create, denied_diagnostics, denied_clear):
         assert "controller-secret-token" not in response.text
         assert "twin-secret-token" not in response.text
