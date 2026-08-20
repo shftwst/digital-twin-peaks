@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Form, Header
+from fastapi import APIRouter, Depends, Form, Header, Request
 
 from enterprise_twins.common.auth.claims import Principal
 from enterprise_twins.common.auth.scenario import ScenarioAccess
@@ -13,6 +13,7 @@ from enterprise_twins.common.events.contracts import (
 from enterprise_twins.common.events.relay_client import RelayClient
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.common.http.etag import parse_quoted_version
+from enterprise_twins.services.identity.authority import select_issuer_origin
 from enterprise_twins.services.identity.issuer import TokenIssuer
 from enterprise_twins.services.identity.repository import IdentityRepository
 from enterprise_twins.services.identity.settings import IdentitySettings
@@ -34,14 +35,15 @@ def identity_router(
     ]
 
     @router.get("/.well-known/openid-configuration")
-    async def metadata() -> dict[str, object]:
+    async def metadata(request: Request) -> dict[str, object]:
+        origin = select_issuer_origin(request, settings.issuer_aliases)
         return {
-            "issuer": settings.issuer,
-            "token_endpoint": f"{settings.issuer}/oauth/token",
-            "jwks_uri": f"{settings.issuer}/.well-known/jwks.json",
+            "issuer": origin,
+            "token_endpoint": f"{origin}/oauth/token",
+            "jwks_uri": f"{origin}/.well-known/jwks.json",
             "grant_types_supported": ["client_credentials"],
             "token_endpoint_auth_methods_supported": ["client_secret_post"],
-            "scopes_supported": [],
+            "scopes_supported": await repository.supported_scopes(),
         }
 
     @router.get("/.well-known/jwks.json")
@@ -50,6 +52,7 @@ def identity_router(
 
     @router.post("/oauth/token")
     async def token(
+        request: Request,
         grant_type: Annotated[str, Form(min_length=1, max_length=80)],
         client_id: Annotated[str, Form(min_length=1, max_length=120)],
         client_secret: Annotated[str, Form(min_length=1, max_length=1000)],
@@ -61,7 +64,13 @@ def identity_router(
                 "grant_type is not supported",
                 status_code=422,
             )
-        result = await repository.authenticate(client_id, client_secret, scope.split())
+        origin = select_issuer_origin(request, settings.issuer_aliases)
+        result = await repository.authenticate(
+            client_id,
+            client_secret,
+            scope.split(),
+            origin,
+        )
         return {
             "access_token": result.access_token,
             "token_type": "bearer",

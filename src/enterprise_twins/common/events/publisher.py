@@ -1,5 +1,8 @@
+import asyncio
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 from sqlalchemy import select
@@ -112,3 +115,68 @@ class OutboxDispatcher:
             record.published = True
             record.published_at = datetime.now(UTC)
             return 1
+
+
+class Dispatcher(Protocol):
+    async def run_once(self) -> int:
+        raise NotImplementedError
+
+
+class DispatcherSupervisor:
+    def __init__(
+        self,
+        dispatcher: Dispatcher,
+        *,
+        interval_seconds: float = 0.05,
+        freshness_seconds: float = 2.0,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.dispatcher = dispatcher
+        self.interval_seconds = interval_seconds
+        self.freshness_seconds = freshness_seconds
+        self.monotonic = monotonic
+        self.task: asyncio.Task[None] | None = None
+        self.last_heartbeat: float | None = None
+        self.last_iteration_failed = False
+
+    def start(self) -> asyncio.Task[None]:
+        if self.task is not None and not self.task.done():
+            raise RuntimeError("dispatcher supervisor is already running")
+        self.last_heartbeat = None
+        self.last_iteration_failed = False
+        self.task = asyncio.create_task(self.run())
+        return self.task
+
+    async def run(self) -> None:
+        while True:
+            try:
+                await self.dispatcher.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.last_iteration_failed = True
+            else:
+                self.last_iteration_failed = False
+                self.last_heartbeat = self.monotonic()
+            await asyncio.sleep(self.interval_seconds)
+
+    def is_ready(self) -> bool:
+        task = self.task
+        heartbeat = self.last_heartbeat
+        return (
+            task is not None
+            and not task.done()
+            and not self.last_iteration_failed
+            and heartbeat is not None
+            and self.monotonic() - heartbeat <= self.freshness_seconds
+        )
+
+    async def stop(self) -> None:
+        task = self.task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass

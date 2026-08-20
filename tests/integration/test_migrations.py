@@ -13,6 +13,15 @@ from enterprise_twins.migration_runner import upgrade
 
 pytestmark = pytest.mark.integration
 
+DROP_VERSION_TABLE = {
+    "identity": text("DROP TABLE IF EXISTS alembic_version_identity"),
+    "relay": text("DROP TABLE IF EXISTS alembic_version_relay"),
+}
+SELECT_VERSION = {
+    "identity": text("SELECT version_num FROM alembic_version_identity"),
+    "relay": text("SELECT version_num FROM alembic_version_relay"),
+}
+
 
 def database_url() -> str:
     value = os.environ.get("TEST_DATABASE_URL")
@@ -21,47 +30,78 @@ def database_url() -> str:
     return value
 
 
-async def clear_identity_schema(url: str) -> None:
+async def clear_service_schema(url: str, service: str) -> None:
     engine = make_engine(url)
     async with engine.begin() as connection:
-        await connection.execute(text("DROP TABLE IF EXISTS alembic_version_identity"))
-        await connection.run_sync(selected_metadata("identity").drop_all)
+        await connection.execute(DROP_VERSION_TABLE[service])
+        await connection.run_sync(selected_metadata(service).drop_all)
     await engine.dispose()
 
 
-async def identity_schema(url: str) -> tuple[set[str], list[str]]:
+async def service_schema(url: str, service: str) -> tuple[set[str], list[str]]:
     engine = make_engine(url)
     async with engine.connect() as connection:
         tables = set(await connection.run_sync(lambda sync: inspect(sync).get_table_names()))
-        versions = list(
-            await connection.scalars(text("SELECT version_num FROM alembic_version_identity"))
-        )
+        versions = list(await connection.scalars(SELECT_VERSION[service]))
     await engine.dispose()
     return tables, versions
 
 
-def test_upgrade_can_run_twice_without_changing_the_schema() -> None:
+@pytest.mark.parametrize("service", ["identity", "relay"])
+def test_upgrade_can_run_twice_without_changing_the_schema(service: str) -> None:
     url = database_url()
-    asyncio.run(clear_identity_schema(url))
+    asyncio.run(clear_service_schema(url, service))
 
-    upgrade("identity", url)
-    upgrade("identity", url)
+    upgrade(service, url)
+    upgrade(service, url)
 
-    tables, versions = asyncio.run(identity_schema(url))
-    assert set(selected_metadata("identity").tables) <= tables
-    assert versions == ["0001_platform_contracts"]
+    tables, versions = asyncio.run(service_schema(url, service))
+    assert set(selected_metadata(service).tables) <= tables
+    assert versions == ["0002_relay_worker_heartbeat"]
+
+
+def test_relay_upgrade_from_0001_adds_the_complete_worker_heartbeat_table() -> None:
+    url = database_url()
+    asyncio.run(clear_service_schema(url, "relay"))
+    upgrade("relay", url)
+
+    async def restore_0001_shape() -> None:
+        engine = make_engine(url)
+        async with engine.begin() as connection:
+            await connection.execute(text("DROP TABLE relay_worker_heartbeat"))
+            await connection.execute(
+                text("UPDATE alembic_version_relay SET version_num = '0001_platform_contracts'")
+            )
+        await engine.dispose()
+
+    asyncio.run(restore_0001_shape())
+    upgrade("relay", url)
+
+    async def heartbeat_columns() -> set[str]:
+        engine = make_engine(url)
+        async with engine.connect() as connection:
+            columns = await connection.run_sync(
+                lambda sync: inspect(sync).get_columns("relay_worker_heartbeat")
+            )
+        await engine.dispose()
+        return {str(column["name"]) for column in columns}
+
+    tables, versions = asyncio.run(service_schema(url, "relay"))
+    assert "relay_worker_heartbeat" in tables
+    assert asyncio.run(heartbeat_columns()) == {"singleton_id", "observed_at", "ready"}
+    assert versions == ["0002_relay_worker_heartbeat"]
 
 
 def test_concurrent_first_upgrades_are_serialised() -> None:
     url = database_url()
-    asyncio.run(clear_identity_schema(url))
+    asyncio.run(clear_service_schema(url, "relay"))
     environment = os.environ | {"TWINS_DATABASE_URL": url}
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = list(
             executor.map(
                 lambda _index: subprocess.run(
-                    [sys.executable, "-m", "enterprise_twins.migration_runner", "identity"],
+                    [sys.executable, "-m", "enterprise_twins.migration_runner", "relay"],
                     check=False,
                     capture_output=True,
                     text=True,
@@ -71,12 +111,12 @@ def test_concurrent_first_upgrades_are_serialised() -> None:
             )
         )
 
-    tables, versions = asyncio.run(identity_schema(url))
+    tables, versions = asyncio.run(service_schema(url, "relay"))
     assert [(result.returncode, result.stderr) for result in results] == [
         (0, ""),
         (0, ""),
         (0, ""),
         (0, ""),
     ]
-    assert set(selected_metadata("identity").tables) <= tables
-    assert versions == ["0001_platform_contracts"]
+    assert set(selected_metadata("relay").tables) <= tables
+    assert versions == ["0002_relay_worker_heartbeat"]

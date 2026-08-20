@@ -181,6 +181,104 @@ class DurableCoordinatorStore:
         return None
 
 
+class CancellationGates:
+    def __init__(self, *stages: str) -> None:
+        self.entered = {stage: asyncio.Event() for stage in stages}
+        self.release = {stage: asyncio.Event() for stage in stages}
+
+    async def at(self, stage: str) -> None:
+        if stage not in self.entered:
+            return
+        self.entered[stage].set()
+        await self.release[stage].wait()
+
+    async def wait_until_entered(self, stage: str) -> None:
+        await asyncio.wait_for(self.entered[stage].wait(), timeout=1)
+
+    def allow(self, stage: str) -> None:
+        self.release[stage].set()
+
+
+class GatedParticipant(Participant):
+    def __init__(
+        self,
+        name: str,
+        gates: CancellationGates,
+        *,
+        fail_load: bool = False,
+        abort_fails: bool = False,
+    ) -> None:
+        super().__init__(name)
+        self.gates = gates
+        self.fail_load = fail_load
+        self.abort_fails = abort_fails
+
+    async def prepare(self, epoch: str) -> None:
+        self.calls.append(("prepare", epoch))
+        await self.gates.at("prepare")
+
+    async def load(self, request: ParticipantLoadRequest) -> ParticipantReport:
+        self.calls.append(("load", request.scenario_epoch))
+        await self.gates.at("load")
+        if self.fail_load:
+            raise RuntimeError("load failed")
+        return ParticipantReport(
+            service=self.name,
+            schemaVersion=str(request.payload["schemaVersion"]),
+            counts=request.payload["expectedCounts"],
+            aliases=request.payload.get("aliases", {}),
+            checksum=request.checksum,
+        )
+
+    async def commit(self, epoch: str) -> None:
+        self.calls.append(("commit", epoch))
+        await self.gates.at("participant_commit")
+        self.active_epoch = epoch
+
+    async def abort(self, epoch: str) -> None:
+        self.calls.append(("abort", epoch))
+        await self.gates.at("abort")
+        if self.abort_fails:
+            raise RuntimeError("private abort failure")
+        if self.active_epoch == epoch:
+            self.active_epoch = "epoch_old"
+
+    async def finalize(self, epoch: str) -> None:
+        self.calls.append(("finalize", epoch))
+        await self.gates.at("participant_finalize_before")
+        await self.gates.at("participant_finalize_after")
+
+
+class GatedStore(DurableCoordinatorStore):
+    def __init__(
+        self,
+        gates: CancellationGates,
+        *,
+        mode: str = "active",
+        active_epoch: str = "epoch_old",
+        pending_epoch: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.gates = gates
+        self.mode = mode
+        self.active_epoch = active_epoch
+        self.pending_epoch = pending_epoch
+
+    async def begin(self, epoch: str, bundle: ScenarioBundle, seed: int) -> None:
+        await self.gates.at("begin_before")
+        await super().begin(epoch, bundle, seed)
+        await self.gates.at("begin_after")
+
+    async def commit(self, epoch: str, bundle: ScenarioBundle, seed: int) -> None:
+        await self.gates.at("control_commit_before")
+        await super().commit(epoch, bundle, seed)
+        await self.gates.at("control_commit_after")
+
+    async def finalize(self, epoch: str) -> None:
+        await self.gates.at("control_finalize")
+        await super().finalize(epoch)
+
+
 def durable_coordinator(
     participants: dict[str, Participant],
     bundle: ScenarioBundle,
@@ -206,6 +304,167 @@ def one_participant_bundle() -> ScenarioBundle:
         initial_time=datetime(2026, 8, 19, 10, tzinfo=UTC),
         payloads={"identity": {"schemaVersion": "1", "expectedCounts": {}}},
     )
+
+
+async def assert_task_waits_for_release(task: asyncio.Task[object]) -> None:
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert not task.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "expected_active_epoch"),
+    [
+        ("begin_before", "epoch_old"),
+        ("begin_after", "epoch_old"),
+        ("prepare", "epoch_old"),
+        ("load", "epoch_old"),
+        ("participant_commit", "epoch_old"),
+        ("control_commit_before", "epoch_old"),
+        ("control_commit_after", "epoch_new"),
+        ("participant_finalize_before", "epoch_new"),
+        ("participant_finalize_after", "epoch_new"),
+        ("control_finalize", "epoch_new"),
+    ],
+)
+async def test_actual_task_cancellation_waits_for_durable_reset_outcome(
+    stage: str,
+    expected_active_epoch: str,
+) -> None:
+    gates = CancellationGates(stage)
+    store = GatedStore(gates)
+    identity = GatedParticipant("identity", gates)
+    coordinator = durable_coordinator({"identity": identity}, one_participant_bundle(), store)
+    task = asyncio.create_task(
+        coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+    )
+
+    await gates.wait_until_entered(stage)
+    task.cancel()
+    if stage in {
+        "participant_finalize_before",
+        "participant_finalize_after",
+        "control_finalize",
+    }:
+        await assert_task_waits_for_release(task)
+    gates.allow(stage)
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert store.pending_epoch is None
+    if expected_active_epoch == "epoch_old":
+        assert store.active_epoch == identity.active_epoch == "epoch_old"
+        assert store.mode == ("active" if stage == "begin_before" else "error")
+    else:
+        assert store.active_epoch == identity.active_epoch
+        assert store.active_epoch != "epoch_old"
+        assert store.mode == "active"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["cleanup", "abort"])
+async def test_actual_cancellation_waits_for_pending_preflight_recovery(
+    recovery: str,
+) -> None:
+    stage = "participant_finalize_before" if recovery == "cleanup" else "abort"
+    gates = CancellationGates(stage)
+    pending_epoch = "epoch_pending"
+    store = GatedStore(
+        gates,
+        mode="finalizing" if recovery == "cleanup" else "aborting",
+        active_epoch=pending_epoch if recovery == "cleanup" else "epoch_old",
+        pending_epoch=pending_epoch,
+    )
+    identity = GatedParticipant("identity", gates)
+    if recovery == "cleanup":
+        identity.active_epoch = pending_epoch
+    coordinator = durable_coordinator({"identity": identity}, one_participant_bundle(), store)
+    task = asyncio.create_task(
+        coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+    )
+
+    await gates.wait_until_entered(stage)
+    task.cancel()
+    await assert_task_waits_for_release(task)
+    gates.allow(stage)
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert store.pending_epoch is None
+    assert store.begin_calls == 0
+    assert store.mode == ("active" if recovery == "cleanup" else "error")
+
+
+@pytest.mark.asyncio
+async def test_actual_cancellation_during_ordinary_failure_compensation_waits_for_abort() -> None:
+    gates = CancellationGates("abort")
+    store = GatedStore(gates)
+    identity = GatedParticipant("identity", gates, fail_load=True)
+    coordinator = durable_coordinator({"identity": identity}, one_participant_bundle(), store)
+    task = asyncio.create_task(
+        coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+    )
+
+    await gates.wait_until_entered("abort")
+    task.cancel()
+    await assert_task_waits_for_release(task)
+    gates.allow("abort")
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert store.pending_epoch is None
+    assert store.mode == "error"
+
+
+@pytest.mark.asyncio
+async def test_repeated_actual_cancellation_never_cancels_the_compensation_child() -> None:
+    gates = CancellationGates("load", "abort")
+    store = GatedStore(gates)
+    identity = GatedParticipant("identity", gates)
+    coordinator = durable_coordinator({"identity": identity}, one_participant_bundle(), store)
+    task = asyncio.create_task(
+        coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+    )
+
+    await gates.wait_until_entered("load")
+    task.cancel()
+    gates.allow("load")
+    await gates.wait_until_entered("abort")
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await assert_task_waits_for_release(task)
+    gates.allow("abort")
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert store.pending_epoch is None
+    assert store.mode == "error"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reset_keeps_persisted_recovery_when_abort_durably_fails() -> None:
+    gates = CancellationGates("load", "abort")
+    store = GatedStore(gates)
+    identity = GatedParticipant("identity", gates, abort_fails=True)
+    coordinator = durable_coordinator({"identity": identity}, one_participant_bundle(), store)
+    task = asyncio.create_task(
+        coordinator.reset(ResetRequest(scenarioId="platform-contracts", version=1))
+    )
+
+    await gates.wait_until_entered("load")
+    task.cancel()
+    gates.allow("load")
+    await gates.wait_until_entered("abort")
+    gates.allow("abort")
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert store.mode == "aborting"
+    assert store.pending_epoch is not None
 
 
 @pytest.mark.asyncio

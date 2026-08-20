@@ -5,15 +5,18 @@ from typing import Annotated, Any, Protocol, cast
 
 import httpx
 import jwt
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from enterprise_twins.common.auth.claims import Principal
 from enterprise_twins.common.auth.credentials import parse_bearer
+from enterprise_twins.common.auth.origins import validate_issuer_origins
 from enterprise_twins.common.control.contracts import ClockValue
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 
 MIN_NUMERIC_DATE = -62_135_596_800
 MAX_NUMERIC_DATE_EXCLUSIVE = 253_402_300_800
+BEARER_AUTH = HTTPBearer(auto_error=False, scheme_name="BearerAuth", bearerFormat="JWT")
 
 
 class TokenClock(Protocol):
@@ -30,13 +33,15 @@ class TokenClock(Protocol):
 class JwtVerifier:
     def __init__(
         self,
-        issuer: str,
+        issuer: str | Sequence[str],
         audience: str,
         jwks_url: str,
         clock: TokenClock,
         client: httpx.AsyncClient,
     ) -> None:
-        self.issuer = issuer
+        self.issuers = validate_issuer_origins(
+            (issuer,) if isinstance(issuer, str) else tuple(issuer)
+        )
         self.audience = audience
         self.jwks_url = jwks_url
         self.clock = clock
@@ -109,7 +114,7 @@ class JwtVerifier:
                 key.key,
                 algorithms=["EdDSA"],
                 audience=self.audience,
-                issuer=self.issuer,
+                issuer=self.issuers,
                 options={
                     "verify_exp": False,
                     "verify_nbf": False,
@@ -192,7 +197,11 @@ class BearerAuthenticator:
 
     async def authenticate(
         self,
-        authorization: Annotated[str | None, Header()] = None,
+        authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
+        _documented_bearer: Annotated[
+            HTTPAuthorizationCredentials | None,
+            Security(BEARER_AUTH),
+        ] = None,
     ) -> Principal:
         token = parse_bearer(authorization)
         if token is None:

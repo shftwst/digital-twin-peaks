@@ -13,6 +13,7 @@ from enterprise_twins.common.http.context import (
 )
 from enterprise_twins.common.http.errors import ApiError, ErrorBody, ErrorCode, ErrorEnvelope
 from enterprise_twins.common.http.health import RuntimeStatus, health_router
+from enterprise_twins.common.http.openapi import business_openapi
 from enterprise_twins.common.ids import new_id
 
 
@@ -29,6 +30,7 @@ def create_app(
     app.include_router(health_router(status))
     for router in routers:
         app.include_router(router)
+    app.openapi = business_openapi(app)  # type: ignore[method-assign]
 
     def request_context(request: Request) -> RequestContext | None:
         context = current_request.get()

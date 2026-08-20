@@ -862,32 +862,70 @@ def write_full_evidence(
         root,
         run_id,
         "network.json",
-        {
-            "composeNetworks": {
-                "webhook-receiver": ["conformance-admin", "twin-webhook-egress"],
-                "conformance": ["conformance-admin", "twin-control", "twin-public"],
-                "public-probe": ["twin-public"],
-            },
-            "runtimeNetworks": {
-                "webhook-receiver": ["conformance-admin", "twin-webhook-egress"],
-                "conformance": ["conformance-admin", "twin-control", "twin-public"],
-                "public-probe": ["twin-public"],
-            },
-            "hostBindings": {
-                "webhook-receiver": {},
-                "conformance": {},
-                "public-probe": {},
-            },
-            "assertions": {
-                "controlNotPublished": True,
-                "conformanceHasNoDatabaseUrl": True,
-                "dockerSocketAbsent": True,
-                "driverOffWebhookEgress": True,
-                "receiverOffControl": True,
-                "publicProbeCannotResolveControl": True,
-            },
-        },
+        valid_network_evidence(),
     )
+
+
+def valid_network_evidence() -> dict[str, object]:
+    networks = {
+        "control": ["twin-control"],
+        "event-relay-api": ["twin-control", "twin-integration"],
+        "event-relay-worker": [
+            "twin-control",
+            "twin-integration",
+            "twin-webhook-egress",
+        ],
+        "event-relay-admin": ["twin-control"],
+        "identity": ["twin-control", "twin-integration", "twin-public"],
+        "identity-admin": ["twin-control"],
+        "crm": ["twin-control", "twin-integration", "twin-public"],
+        "crm-admin": ["twin-control"],
+        "postgres": ["twin-control", "twin-integration"],
+        "test-runner": ["twin-control", "twin-public"],
+        "webhook-receiver": ["conformance-admin", "twin-webhook-egress"],
+        "conformance": ["conformance-admin", "twin-control", "twin-public"],
+        "public-probe": ["twin-public"],
+    }
+    host_bindings: dict[str, object] = {name: {} for name in networks}
+    host_bindings["identity"] = {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8101"}]}
+    host_bindings["crm"] = {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8102"}]}
+    probe_targets = (
+        "control",
+        "postgres",
+        "event-relay-api",
+        "event-relay-worker",
+        "event-relay-admin",
+        "identity-admin",
+        "crm-admin",
+    )
+    return {
+        "composeNetworks": networks,
+        "runtimeNetworks": networks,
+        "composeNetworkInternal": {
+            "conformance-admin": True,
+            "twin-control": True,
+            "twin-integration": True,
+            "twin-public": False,
+            "twin-webhook-egress": True,
+        },
+        "runtimeNetworkInternal": {
+            "conformance-admin": True,
+            "twin-control": True,
+            "twin-integration": True,
+            "twin-public": False,
+            "twin-webhook-egress": True,
+        },
+        "hostBindings": host_bindings,
+        "publicProbeIsolation": {
+            name: {"resolved": False, "reachable": False} for name in probe_targets
+        },
+        "security": {
+            "dockerSocketMounts": [],
+            "conformanceDatabaseEnvironmentKeys": [],
+            "workerExposedPorts": [],
+        },
+        "workerCommand": ["enterprise_twins.services.relay.delivery"],
+    }
 
 
 def driver_for(root: Path, run_id: str) -> Driver:
@@ -895,6 +933,16 @@ def driver_for(root: Path, run_id: str) -> Driver:
     driver.run_id = run_id
     driver.artifacts = root
     return driver
+
+
+def test_summary_accepts_exhaustive_canonical_network_evidence(tmp_path: Path) -> None:
+    run_id = "run-exhaustive-network"
+    write_full_evidence(tmp_path, run_id)
+
+    driver_for(tmp_path, run_id).summarise("platform-contracts")
+
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["networkIsolation"] == "passed"
 
 
 def call_for(calls: list[dict[str, object]], operation: str) -> dict[str, object]:
@@ -906,20 +954,35 @@ def call_for(calls: list[dict[str, object]], operation: str) -> dict[str, object
     [
         (
             "composeNetworks",
-            "conformance",
-            ["conformance-admin", "twin-control", "twin-public", "twin-webhook-egress"],
+            "event-relay-worker",
+            ["twin-control", "twin-integration"],
         ),
         (
             "runtimeNetworks",
-            "conformance",
-            ["conformance-admin", "twin-control", "twin-public", "twin-webhook-egress"],
+            "event-relay-api",
+            ["twin-control", "twin-integration", "twin-public"],
         ),
         (
             "hostBindings",
-            "conformance",
+            "control",
             {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "18000"}]},
         ),
-        ("assertions", "receiverOffControl", 1),
+        (
+            "hostBindings",
+            "identity",
+            {
+                "8000/tcp": [
+                    {"HostIp": "0.0.0.0", "HostPort": "8101"}  # noqa: S104
+                ]
+            },
+        ),
+        ("composeNetworkInternal", "twin-control", False),
+        ("runtimeNetworkInternal", "twin-integration", False),
+        (
+            "publicProbeIsolation",
+            "identity-admin",
+            {"resolved": True, "reachable": False},
+        ),
     ],
 )
 def test_summary_rejects_network_evidence_mutation(
@@ -934,6 +997,35 @@ def test_summary_rejects_network_evidence_mutation(
     values = network[section]
     assert isinstance(values, dict)
     values[service] = replacement
+    write_run_file(tmp_path, run_id, "network.json", network)
+
+    with pytest.raises(AssertionError, match="network evidence"):
+        driver_for(tmp_path, run_id).summarise("platform-contracts")
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        (
+            "security",
+            {
+                "dockerSocketMounts": ["conformance:/var/run/docker.sock"],
+                "conformanceDatabaseEnvironmentKeys": [],
+                "workerExposedPorts": [],
+            },
+        ),
+        ("workerCommand", ["uvicorn", "unexpected:app"]),
+    ],
+)
+def test_summary_rejects_network_security_or_listener_mutation(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    run_id = "run-network-security-mutation"
+    write_full_evidence(tmp_path, run_id)
+    network = read_run_body(tmp_path, "network.json")
+    network[field] = replacement
     write_run_file(tmp_path, run_id, "network.json", network)
 
     with pytest.raises(AssertionError, match="network evidence"):

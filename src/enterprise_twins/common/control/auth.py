@@ -12,7 +12,9 @@ def require_token(expected: str) -> Callable[[str | None], None]:
 
     def check(authorization: str | None = Header(default=None)) -> None:
         supplied = parse_bearer(authorization)
-        if supplied is None or not hmac.compare_digest(supplied, expected):
+        if supplied is None or not hmac.compare_digest(
+            supplied.encode("ascii"), expected.encode("ascii")
+        ):
             raise ApiError(ErrorCode.UNAUTHENTICATED, "invalid private credential", status_code=401)
 
     return check

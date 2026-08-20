@@ -47,11 +47,13 @@ class TokenIssuer:
         scopes: list[str],
         now: datetime,
         scenario_epoch: str,
+        *,
+        issuer: str | None = None,
     ) -> tuple[str, str]:
         token_id = new_id("tok")
         issued_at = int(now.timestamp())
         claims = {
-            "iss": self.issuer,
+            "iss": issuer or self.issuer,
             "aud": self.audience,
             "sub": client.subject,
             "actor_type": client.actor_type,

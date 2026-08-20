@@ -1,6 +1,5 @@
-import asyncio
 from collections.abc import AsyncIterator, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
@@ -13,7 +12,7 @@ from enterprise_twins.common.auth.verifier import BearerAuthenticator, JwtVerifi
 from enterprise_twins.common.control.client import ControlClient
 from enterprise_twins.common.db.records import ScenarioState
 from enterprise_twins.common.db.runtime import make_engine, make_session_factory
-from enterprise_twins.common.events.publisher import OutboxDispatcher
+from enterprise_twins.common.events.publisher import DispatcherSupervisor, OutboxDispatcher
 from enterprise_twins.common.events.relay_client import RelayClient
 from enterprise_twins.common.http.app import create_app
 from enterprise_twins.common.http.errors import ApiError
@@ -28,9 +27,14 @@ class CrmStatus:
         self,
         factory: async_sessionmaker[AsyncSession],
         control: CrmControl,
+        *,
+        dispatcher: DispatcherSupervisor | None = None,
+        relay: RelayClient | None = None,
     ) -> None:
         self.factory = factory
         self.control = control
+        self.dispatcher = dispatcher
+        self.relay = relay
 
     async def state(self) -> ScenarioState:
         async with self.factory() as session:
@@ -63,6 +67,19 @@ class CrmStatus:
             checks["control"] = "epoch_mismatch"
             return False, checks
         checks["control"] = "ready"
+        if self.dispatcher is not None and self.relay is not None:
+            checks["dispatcher"] = "ready" if self.dispatcher.is_ready() else "not_ready"
+            checks["relay"] = "not_ready"
+            try:
+                relay_epoch = await self.relay.ready_epoch()
+            except ApiError, OSError, RuntimeError:
+                return False, checks
+            if relay_epoch != state.active_epoch:
+                checks["relay"] = "epoch_mismatch"
+                return False, checks
+            checks["relay"] = "ready"
+            if checks["dispatcher"] != "ready":
+                return False, checks
         return True, checks
 
 
@@ -73,6 +90,7 @@ def create_crm_app(
     verifier: JwtVerifier,
     relay: RelayClient | None = None,
     lifespan: Callable[[FastAPI], AbstractAsyncContextManager[None]] | None = None,
+    dispatcher: DispatcherSupervisor | None = None,
 ) -> FastAPI:
     authenticator = BearerAuthenticator(
         verifier,
@@ -83,7 +101,12 @@ def create_crm_app(
     return create_app(
         "CRM twin",
         ("crm:read", "crm:notes:write", "webhooks:manage"),
-        CrmStatus(factory, control),
+        CrmStatus(
+            factory,
+            control,
+            dispatcher=dispatcher,
+            relay=relay if dispatcher is not None else None,
+        ),
         (
             crm_router(
                 repository,
@@ -104,7 +127,7 @@ def create_from_env() -> FastAPI:
     http_client = httpx.AsyncClient()
     control = ControlClient(settings.control_url, settings.control_token, http_client)
     verifier = JwtVerifier(
-        settings.identity_issuer,
+        settings.identity_issuer_aliases,
         settings.identity_audience,
         settings.identity_jwks_url,
         control,
@@ -112,24 +135,15 @@ def create_from_env() -> FastAPI:
     )
     relay = RelayClient(settings.relay_url, "crm", settings.relay_token, http_client)
     dispatcher = OutboxDispatcher(factory, relay)
+    supervisor = DispatcherSupervisor(dispatcher)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        async def dispatch() -> None:
-            while True:
-                try:
-                    await dispatcher.run_once()
-                except SQLAlchemyError:
-                    pass
-                await asyncio.sleep(0.05)
-
-        task = asyncio.create_task(dispatch())
+        supervisor.start()
         try:
             yield
         finally:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+            await supervisor.stop()
             await http_client.aclose()
             await engine.dispose()
 
@@ -140,4 +154,5 @@ def create_from_env() -> FastAPI:
         verifier,
         relay,
         lifespan,
+        supervisor,
     )

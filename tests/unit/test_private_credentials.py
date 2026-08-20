@@ -19,6 +19,23 @@ from enterprise_twins.services.crm.settings import CrmSettings
 from enterprise_twins.services.identity.settings import IdentitySettings
 from enterprise_twins.services.relay.settings import RelaySettings
 
+INVALID_CREDENTIALS = [
+    "",
+    " ",
+    "embedded whitespace",
+    "embedded\twhitespace",
+    "non-ascii-é",
+    "zero-width-\u200b",
+    "nul-\x00",
+    "c0-\x1f",
+    "del-\x7f",
+    "c1-\x80",
+    "invalid!punctuation",
+    "=leading-padding",
+    "padding=inside",
+    "padding==inside",
+]
+
 
 def control_settings(**overrides: object) -> ControlSettings:
     values: dict[str, object] = {
@@ -63,7 +80,7 @@ def relay_settings(**overrides: object) -> RelaySettings:
     return RelaySettings.model_validate(values | overrides)
 
 
-@pytest.mark.parametrize("invalid", ["", " \t", "embedded whitespace"])
+@pytest.mark.parametrize("invalid", INVALID_CREDENTIALS)
 @pytest.mark.parametrize(
     ("factory", "field"),
     [
@@ -94,16 +111,10 @@ def test_all_credential_settings_reject_empty_or_whitespace_values(
 
 @pytest.mark.parametrize(
     "source_tokens",
-    [
-        {"": "source-token"},
-        {" \t": "source-token"},
-        {"embedded whitespace": "source-token"},
-        {"crm": ""},
-        {"crm": " \t"},
-        {"crm": "embedded whitespace"},
-    ],
+    [{invalid: "source-token"} for invalid in INVALID_CREDENTIALS]
+    + [{"crm": invalid} for invalid in INVALID_CREDENTIALS],
 )
-def test_relay_source_token_keys_and_values_reject_whitespace(
+def test_relay_source_token_keys_and_values_reject_invalid_token68(
     source_tokens: dict[str, str],
 ) -> None:
     with pytest.raises(ValidationError):
@@ -114,7 +125,7 @@ def test_empty_relay_source_token_map_remains_a_fail_closed_valid_configuration(
     assert relay_settings(source_tokens={}).source_tokens == {}
 
 
-@pytest.mark.parametrize("token", ["", " \t", "embedded whitespace"])
+@pytest.mark.parametrize("token", INVALID_CREDENTIALS)
 def test_conformance_receiver_rejects_invalid_control_token_during_construction(
     token: str,
 ) -> None:
@@ -123,7 +134,7 @@ def test_conformance_receiver_rejects_invalid_control_token_during_construction(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("token", ["", " \t", "embedded whitespace"])
+@pytest.mark.parametrize("token", INVALID_CREDENTIALS)
 @pytest.mark.parametrize("client_type", ["control", "relay", "participant"])
 async def test_direct_private_clients_reject_invalid_tokens_during_construction(
     client_type: str,
@@ -142,6 +153,7 @@ async def test_direct_private_clients_reject_invalid_tokens_during_construction(
 def test_private_token_dependency_accepts_only_an_exact_bearer_header() -> None:
     dependency = require_token("private-token")
     dependency("Bearer private-token")
+    require_token("private-token==")("Bearer private-token==")
 
     for header in (
         None,
@@ -152,6 +164,15 @@ def test_private_token_dependency_accepts_only_an_exact_bearer_header() -> None:
         " Bearer private-token",
         "Bearer private-token ",
         "Bearer private token",
+        "Bearer invalid!punctuation",
+        "Bearer =leading-padding",
+        "Bearer padding=inside",
+        "Bearer non-ascii-é",
+        "Bearer zero-width-\u200b",
+        "Bearer nul-\x00",
+        "Bearer c0-\x1f",
+        "Bearer del-\x7f",
+        "Bearer c1-\x80",
     ):
         with pytest.raises(ApiError) as raised:
             dependency(header)
@@ -188,6 +209,15 @@ async def test_bearer_authenticator_rejects_noncanonical_headers_before_verifica
         " Bearer token",
         "Bearer token ",
         "Bearer to ken",
+        "Bearer invalid!punctuation",
+        "Bearer =leading-padding",
+        "Bearer padding=inside",
+        "Bearer non-ascii-é",
+        "Bearer zero-width-\u200b",
+        "Bearer nul-\x00",
+        "Bearer c0-\x1f",
+        "Bearer del-\x7f",
+        "Bearer c1-\x80",
     ):
         with pytest.raises(ApiError) as raised:
             await authenticator.authenticate(header)

@@ -22,6 +22,7 @@ from enterprise_twins.services.crm.schemas import (
     CustomerView,
     NoteCreate,
     NotePage,
+    NoteView,
 )
 from enterprise_twins.services.crm.service import CrmService, apply_post_commit_fault
 
@@ -71,7 +72,17 @@ def crm_router(
             expected_epoch=principal.scenario_epoch,
         )
 
-    @router.get("/v1/customers/{customer_id}")
+    @router.get(
+        "/v1/customers/{customer_id}",
+        responses={
+            200: {
+                "headers": {
+                    "ETag": {"schema": {"type": "string"}},
+                    "X-Resource-Version": {"schema": {"type": "string"}},
+                }
+            }
+        },
+    )
     async def get_customer(
         customer_id: str,
         principal: ReadPrincipal,
@@ -98,7 +109,20 @@ def crm_router(
             principal.scenario_epoch,
         )
 
-    @router.post("/v1/customers/{customer_id}/notes")
+    @router.post(
+        "/v1/customers/{customer_id}/notes",
+        status_code=201,
+        response_model=NoteView,
+        responses={
+            201: {
+                "headers": {
+                    "ETag": {"schema": {"type": "string"}},
+                    "X-Customer-Version": {"schema": {"type": "string"}},
+                    "Idempotency-Replayed": {"schema": {"type": "string"}},
+                }
+            }
+        },
+    )
     async def create_note(
         customer_id: str,
         body: NoteCreate,

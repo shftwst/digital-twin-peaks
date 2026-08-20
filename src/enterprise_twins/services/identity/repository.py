@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -12,6 +13,7 @@ from enterprise_twins.common.control.contracts import (
     FaultPhase,
     FaultProbe,
 )
+from enterprise_twins.common.control.fault_capabilities import FAULT_CAPABILITIES
 from enterprise_twins.common.db.records import ScenarioState
 from enterprise_twins.common.events.publisher import record_audit, record_event
 from enterprise_twins.common.http.context import bind_response_epoch, current_request
@@ -91,6 +93,7 @@ class IdentityRepository:
         client_id: str,
         secret: str,
         requested_scopes: list[str],
+        issuer_origin: str | None = None,
     ) -> TokenResult:
         decision = await self.control.evaluate_fault(
             FaultProbe(
@@ -100,13 +103,13 @@ class IdentityRepository:
                 actorId=client_id,
             )
         )
-        if decision.effect == FaultEffect.RATE_LIMITED:
-            raise ApiError(
-                ErrorCode.RATE_LIMITED,
-                "token endpoint is rate limited",
-                status_code=429,
-                retryable=True,
-            )
+        supported_effects = FAULT_CAPABILITIES[
+            ("identity", "identity.token.issue", FaultPhase.BEFORE_COMMIT)
+        ]
+        if decision.effect is not None and decision.effect not in supported_effects:
+            raise RuntimeError("unsupported Identity token fault effect")
+        if decision.effect == FaultEffect.TIMEOUT:
+            await asyncio.sleep(min(decision.delay_ms or 250, 2_000) / 1_000)
         if decision.effect in {FaultEffect.TEMPORARY_FAILURE, FaultEffect.TIMEOUT}:
             raise ApiError(
                 ErrorCode.TEMPORARILY_UNAVAILABLE,
@@ -168,7 +171,13 @@ class IdentityRepository:
                     "requested scope is not granted",
                     status_code=403,
                 )
-            token, token_id = self.issuer.issue(client, scopes, now, epoch)
+            token, token_id = self.issuer.issue(
+                client,
+                scopes,
+                now,
+                epoch,
+                issuer=issuer_origin,
+            )
             context = current_request.get()
             correlation_id = context.correlation_id if context else token_id
             request_id = context.request_id if context else token_id
@@ -197,3 +206,27 @@ class IdentityRepository:
                 data={"subject": client.subject, "role": client.role, "tokenId": token_id},
             )
             return TokenResult(token, token_id, scopes, self.settings.token_ttl_seconds)
+
+    async def supported_scopes(self) -> list[str]:
+        async with self.factory.begin() as session:
+            state = await session.scalar(
+                select(ScenarioState)
+                .where(ScenarioState.singleton_id == 1)
+                .with_for_update(read=True)
+            )
+            if state is not None:
+                bind_response_epoch(state.active_epoch)
+            if state is None or state.mode != "active":
+                raise ApiError(
+                    ErrorCode.TEMPORARILY_UNAVAILABLE,
+                    "identity scenario is not active",
+                    status_code=503,
+                    retryable=True,
+                )
+            rows = await session.scalars(
+                select(IdentityClient.scopes).where(
+                    IdentityClient.scenario_epoch == state.active_epoch,
+                    IdentityClient.active.is_(True),
+                )
+            )
+            return sorted({scope for scopes in rows for scope in scopes})

@@ -11,6 +11,12 @@ from enterprise_twins.common.control.contracts import (
     FaultProbe,
     FaultRuleCreate,
 )
+from enterprise_twins.common.control.fault_capabilities import (
+    FAULT_CAPABILITIES,
+    unsupported_fault,
+    validate_fault_probe,
+    validate_fault_rule,
+)
 from enterprise_twins.common.db.records import ScenarioState
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.common.ids import new_id
@@ -31,6 +37,7 @@ class FaultRepository:
         )
 
     async def create(self, request: FaultRuleCreate) -> FaultRuleCreate:
+        validate_fault_rule(request)
         async with self.factory.begin() as session:
             state = await self.lock_state(session)
             if state is None or state.mode != "active":
@@ -63,6 +70,7 @@ class FaultRepository:
         return request
 
     async def evaluate(self, probe: FaultProbe) -> FaultDecision:
+        validate_fault_probe(probe)
         async with self.factory.begin() as session:
             state = await self.lock_state(session)
             clock = await session.get(VirtualClock, 1)
@@ -95,6 +103,13 @@ class FaultRepository:
             )
             if rule is None:
                 return FaultDecision()
+            try:
+                effect = FaultEffect(rule.effect)
+            except ValueError:
+                raise unsupported_fault() from None
+            supported = FAULT_CAPABILITIES[(probe.target_service, probe.operation, probe.phase)]
+            if effect not in supported:
+                raise unsupported_fault()
             rule.seen_count += 1
             if rule.seen_count < rule.occurrence:
                 return FaultDecision()
@@ -113,7 +128,7 @@ class FaultRepository:
             )
             return FaultDecision(
                 ruleId=rule.rule_id,
-                effect=FaultEffect(rule.effect),
+                effect=effect,
                 delayMs=rule.delay_ms,
                 responseData=rule.response_data,
             )

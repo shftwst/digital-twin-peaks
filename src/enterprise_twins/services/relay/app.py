@@ -1,5 +1,6 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 import httpx
 from fastapi import FastAPI
@@ -14,6 +15,7 @@ from enterprise_twins.common.http.errors import ApiError
 from enterprise_twins.services.relay.api import relay_router
 from enterprise_twins.services.relay.repository import RelayRepository
 from enterprise_twins.services.relay.settings import RelaySettings
+from enterprise_twins.services.relay.worker_health import worker_heartbeat_state
 
 
 class RelayStatus:
@@ -21,9 +23,14 @@ class RelayStatus:
         self,
         factory: async_sessionmaker[AsyncSession],
         control: ControlClient,
+        repository: RelayRepository | None = None,
+        *,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.factory = factory
         self.control = control
+        self.repository = repository
+        self.wall_clock = wall_clock
 
     async def state(self) -> ScenarioState:
         async with self.factory() as session:
@@ -56,6 +63,18 @@ class RelayStatus:
             checks["control"] = "epoch_mismatch"
             return False, checks
         checks["control"] = "ready"
+        if self.repository is not None:
+            try:
+                worker = await worker_heartbeat_state(
+                    self.repository,
+                    now=self.wall_clock(),
+                )
+            except OSError, RuntimeError, SQLAlchemyError:
+                checks["worker"] = "unavailable"
+                return False, checks
+            checks["worker"] = worker
+            if worker != "ready":
+                return False, checks
         return True, checks
 
 
@@ -78,7 +97,7 @@ def create_from_env() -> FastAPI:
     return create_app(
         "Event Relay integration API",
         (),
-        RelayStatus(factory, control),
+        RelayStatus(factory, control, repository),
         (relay_router(repository, control, settings),),
         lifespan,
     )

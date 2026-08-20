@@ -165,6 +165,39 @@ async def test_unknown_key_refreshes_once_then_uses_the_cached_ed25519_key() -> 
 
 
 @pytest.mark.asyncio
+async def test_verifier_accepts_only_explicit_issuer_aliases_and_uses_fixed_internal_jwks() -> None:
+    private_key, public_jwk = signing_material()
+    requests: list[httpx.Request] = []
+
+    async def jwks(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"keys": [public_jwk]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(jwks)) as client:
+        verifier = JwtVerifier(
+            ("http://identity:8000", "http://127.0.0.1:8101"),
+            "enterprise-twins",
+            "http://identity:8000/.well-known/jwks.json",
+            Clock(),
+            client,
+        )
+        internal = await verifier.verify(
+            token(private_key, values=claims(iss="http://identity:8000"))
+        )
+        loopback = await verifier.verify(
+            token(private_key, values=claims(iss="http://127.0.0.1:8101"))
+        )
+        with pytest.raises(ApiError) as untrusted:
+            await verifier.verify(token(private_key, values=claims(iss="http://attacker.example")))
+
+    assert internal.subject == loopback.subject == "person-1"
+    assert untrusted.value.code == ErrorCode.UNAUTHENTICATED
+    assert [str(request.url) for request in requests] == [
+        "http://identity:8000/.well-known/jwks.json"
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "changed_claims",
     [

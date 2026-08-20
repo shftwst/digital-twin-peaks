@@ -19,7 +19,7 @@ from enterprise_twins.common.http.app import create_app
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.relay.api import relay_router
 from enterprise_twins.services.relay.app import RelayStatus
-from enterprise_twins.services.relay.models import SourceEvent, Subscription
+from enterprise_twins.services.relay.models import SourceEvent, Subscription, WorkerHeartbeat
 from enterprise_twins.services.relay.repository import RelayRepository
 from enterprise_twins.services.relay.settings import RelaySettings
 
@@ -256,6 +256,9 @@ async def test_source_routes_enforce_roles_redact_tokens_and_replay_original_sec
         " Bearer crm-source-secret",
         "Bearer crm-source-secret ",
         "Bearer crm source-secret",
+        "Bearer invalid!punctuation",
+        "Bearer =leading-padding",
+        "Bearer padding=inside",
     ],
 )
 async def test_source_routes_reject_noncanonical_bearer_headers_before_repository_work(
@@ -274,6 +277,38 @@ async def test_source_routes_reject_noncanonical_bearer_headers_before_repositor
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "unauthenticated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "authorization",
+    [
+        b"Bearer token\xe9",
+        b"Bearer token\xe2\x80\x8b",
+        b"Bearer token\x00",
+        b"Bearer token\x80",
+        b"Bearer token\x7f",
+    ],
+)
+async def test_source_routes_reject_non_ascii_and_control_bearer_bytes_before_control_work(
+    db: async_sessionmaker[AsyncSession],
+    authorization: bytes,
+) -> None:
+    repository = await initialise_relay(db)
+    control = SnapshotClock()
+    headers = httpx.Headers([(b"authorization", authorization)])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=relay_app(db, repository, control)),
+        base_url="http://relay",
+    ) as client:
+        response = await client.get(
+            "/internal/v1/sources/crm/subscriptions",
+            headers=headers,
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthenticated"
+    assert control.snapshot_calls == 0
 
 
 @pytest.mark.asyncio
@@ -649,16 +684,29 @@ async def test_relay_client_malformed_successes_are_generic_and_retryable(
 
 
 @pytest.mark.asyncio
-async def test_relay_client_preserves_explicit_relay_api_errors() -> None:
-    async def conflict(_request: httpx.Request) -> httpx.Response:
+@pytest.mark.parametrize(
+    ("status", "code", "expected_message"),
+    [
+        (404, "not_found", "event relay resource was not found"),
+        (409, "conflict", "event relay request conflicts"),
+        (422, "invalid_request", "event relay request is invalid"),
+    ],
+)
+async def test_relay_client_preserves_only_safe_typed_domain_errors(
+    status: int,
+    code: str,
+    expected_message: str,
+) -> None:
+    async def safe_error(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            409,
+            status,
             json={
                 "error": {
-                    "code": "conflict",
-                    "message": "subscription request conflicts",
+                    "code": code,
+                    "message": "private relay marker",
                     "retryable": False,
-                    "details": {"operation": "identity.subscription.create"},
+                    "requestId": "private-request-id",
+                    "details": {"private": "marker"},
                 }
             },
         )
@@ -667,16 +715,155 @@ async def test_relay_client_preserves_explicit_relay_api_errors() -> None:
         eventTypes=["crm.note.created"],
         targetUrl="http://webhook-receiver/events",
     )
-    async with httpx.AsyncClient(transport=httpx.MockTransport(conflict)) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(safe_error)) as client:
         relay = RelayClient("http://relay", "crm", "source-secret", client)
         with pytest.raises(ApiError) as raised:
             await relay.create_subscription("person-1", "idem-1", request)
 
-    assert raised.value.code == ErrorCode.CONFLICT
-    assert raised.value.status_code == 409
-    assert raised.value.message == "subscription request conflicts"
+    assert raised.value.code == ErrorCode(code)
+    assert raised.value.status_code == status
+    assert raised.value.message == expected_message
     assert raised.value.retryable is False
-    assert raised.value.details == {"operation": "identity.subscription.create"}
+    assert raised.value.details == {}
+    assert "private" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "content_type"),
+    [
+        (
+            401,
+            {
+                "error": {
+                    "code": "unauthenticated",
+                    "message": "private credential rejected",
+                    "retryable": False,
+                    "requestId": "private-request-id",
+                    "details": {"private": "marker"},
+                }
+            },
+            "application/json",
+        ),
+        (
+            403,
+            {
+                "error": {
+                    "code": "forbidden",
+                    "message": "private source forbidden",
+                    "retryable": False,
+                    "requestId": "private-request-id",
+                    "details": {},
+                }
+            },
+            "application/json",
+        ),
+        (
+            503,
+            {
+                "error": {
+                    "code": "temporarily_unavailable",
+                    "message": "private database marker",
+                    "retryable": True,
+                    "requestId": "private-request-id",
+                    "details": {},
+                }
+            },
+            "application/json",
+        ),
+        (400, {"error": {"code": "invalid_request"}}, "application/json"),
+        (
+            409,
+            {
+                "error": {
+                    "code": "conflict",
+                    "message": "private relay marker",
+                    "retryable": "false",
+                    "requestId": "private-request-id",
+                    "details": {},
+                }
+            },
+            "application/json",
+        ),
+        (
+            409,
+            {
+                "error": {
+                    "code": "conflict",
+                    "message": "private relay marker",
+                    "retryable": False,
+                    "requestId": "private-request-id",
+                    "details": {},
+                    "extra": "private marker",
+                }
+            },
+            "application/json",
+        ),
+        (
+            409,
+            {
+                "error": {
+                    "code": "conflict",
+                    "message": "private relay marker",
+                    "retryable": False,
+                    "requestId": "private-request-id",
+                    "details": {},
+                },
+                "extra": "private marker",
+            },
+            "application/json",
+        ),
+        (
+            409,
+            {
+                "error": {
+                    "code": "not_found",
+                    "message": "private relay marker",
+                    "retryable": False,
+                    "requestId": "private-request-id",
+                    "details": {},
+                }
+            },
+            "application/json",
+        ),
+        (
+            409,
+            {
+                "error": {
+                    "code": "conflict",
+                    "message": "private relay marker",
+                    "retryable": False,
+                    "requestId": "private-request-id",
+                    "details": {},
+                }
+            },
+            "text/plain",
+        ),
+    ],
+)
+async def test_relay_client_maps_private_and_malformed_errors_to_redacted_503(
+    status: int,
+    body: dict[str, object],
+    content_type: str,
+) -> None:
+    async def private_error(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json=body, headers={"Content-Type": content_type})
+
+    request = WebhookSubscriptionCreate(
+        eventTypes=["crm.note.created"],
+        targetUrl="http://webhook-receiver/events",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(private_error)) as client:
+        relay = RelayClient("http://relay", "crm", "source-secret", client)
+        with pytest.raises(ApiError) as raised:
+            await relay.create_subscription("person-1", "idem-1", request)
+
+    assert raised.value.code == ErrorCode.TEMPORARILY_UNAVAILABLE
+    assert raised.value.status_code == 503
+    assert raised.value.retryable is True
+    assert raised.value.message == "event relay is temporarily unavailable"
+    assert raised.value.details == {}
+    assert "private" not in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -784,6 +971,61 @@ async def test_readiness_returns_503_when_the_database_query_fails(
         "checks": {"database": "not_ready", "scenario": "unavailable"},
     }
     assert response.headers["X-Scenario-Epoch"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_relay_readiness_requires_a_fresh_persisted_worker_heartbeat(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db)
+    status = RelayStatus(db, Clock(), repository, wall_clock=lambda: NOW)
+
+    ready, checks = await status.readiness()
+    assert ready is False
+    assert checks["worker"] == "missing"
+
+    await repository.record_worker_heartbeat(NOW, ready=False)
+    ready, checks = await status.readiness()
+    assert ready is False
+    assert checks["worker"] == "degraded"
+
+    await repository.record_worker_heartbeat(NOW.replace(hour=9), ready=True)
+    ready, checks = await status.readiness()
+    assert ready is False
+    assert checks["worker"] == "stale"
+
+    await repository.record_worker_heartbeat(NOW, ready=True)
+    ready, checks = await status.readiness()
+    assert ready is True
+    assert checks["worker"] == "ready"
+    async with db() as session:
+        heartbeat = await session.get(WorkerHeartbeat, 1)
+    assert heartbeat is not None
+    assert heartbeat.observed_at == NOW
+    assert heartbeat.ready is True
+
+
+@pytest.mark.asyncio
+async def test_relay_readiness_maps_worker_heartbeat_query_failure_to_not_ready(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    await initialise_relay(db)
+
+    class BrokenHeartbeatRepository:
+        async def worker_heartbeat(self) -> None:
+            raise RuntimeError("private database detail")
+
+    status = RelayStatus(db, Clock(), BrokenHeartbeatRepository())  # type: ignore[arg-type]
+
+    assert await status.readiness() == (
+        False,
+        {
+            "database": "ready",
+            "scenario": "active",
+            "control": "ready",
+            "worker": "unavailable",
+        },
+    )
 
 
 @pytest.mark.asyncio

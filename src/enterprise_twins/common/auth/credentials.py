@@ -1,11 +1,14 @@
+import re
 from typing import Annotated
 
 from pydantic import AfterValidator
 
+TOKEN68 = re.compile(r"[A-Za-z0-9._~+/\-]+={0,}", re.ASCII)
+
 
 def validate_private_credential(value: str) -> str:
-    if not value or any(character.isspace() for character in value):
-        raise ValueError("private credential must be non-empty and contain no whitespace")
+    if TOKEN68.fullmatch(value) is None:
+        raise ValueError("private credential must use the HTTP-safe token68 grammar")
     return value
 
 
@@ -16,6 +19,7 @@ def parse_bearer(authorization: str | None) -> str | None:
     if authorization is None or not authorization.startswith("Bearer "):
         return None
     token = authorization[len("Bearer ") :]
-    if not token or any(character.isspace() for character in token):
+    try:
+        return validate_private_credential(token)
+    except ValueError:
         return None
-    return token

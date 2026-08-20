@@ -300,86 +300,101 @@ class ResetCoordinator:
             raise self.abort_unavailable() from None
         self.test_mode = "error"
 
-    async def compensate_cancellation(self, epoch: str) -> None:
-        task = asyncio.create_task(self.recover_interrupted_epoch(epoch))
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            try:
-                await task
-            except Exception:
+    async def compensate_cancellation(self, epoch: str | None) -> None:
+        async def recover() -> None:
+            if epoch is None:
+                await self.recover_pending_cleanup_unlocked()
+                await self.recover_pending_abort_unlocked()
                 return
-        except Exception:
+            await self.recover_interrupted_epoch(epoch)
+
+        recovery = asyncio.create_task(recover())
+        while not recovery.done():
+            try:
+                await asyncio.shield(recovery)
+            except asyncio.CancelledError:
+                if recovery.done():
+                    break
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+            except Exception:
+                break
+        try:
+            recovery.result()
+        except Exception, asyncio.CancelledError:
             return
 
     async def reset(self, request: ResetRequest) -> ResetResult:
         async with self.lock:
-            await self.recover_pending_cleanup_unlocked()
-            await self.recover_pending_abort_unlocked()
-            bundle = self.load_bundle(request.scenario_id, request.version)
-            if set(self.participants) != set(bundle.payloads):
-                raise ValueError("participant services differ from scenario bundle services")
-            seed = (
-                request.random_seed
-                if request.random_seed is not None
-                else derive_seed(request.scenario_id, request.version)
-            )
-            manifest_checksum = bundle.checksum(seed)
-            epoch = new_id("epoch")
-            reports: list[ParticipantReport] = []
+            epoch: str | None = None
             try:
-                await self.begin_control(epoch, bundle, seed)
-                for participant in self.participants.values():
-                    await participant.prepare(epoch)
-                for name, participant in self.participants.items():
-                    payload = bundle.payloads[name]
-                    checksum = sha256_hex(payload)
-                    report = await participant.load(
-                        ParticipantLoadRequest(
-                            scenarioEpoch=epoch,
-                            scenarioId=bundle.scenario_id,
-                            scenarioVersion=bundle.version,
-                            randomSeed=seed,
-                            payload=payload,
-                            checksum=checksum,
-                            manifestChecksum=manifest_checksum,
+                await self.recover_pending_cleanup_unlocked()
+                await self.recover_pending_abort_unlocked()
+                bundle = self.load_bundle(request.scenario_id, request.version)
+                if set(self.participants) != set(bundle.payloads):
+                    raise ValueError("participant services differ from scenario bundle services")
+                seed = (
+                    request.random_seed
+                    if request.random_seed is not None
+                    else derive_seed(request.scenario_id, request.version)
+                )
+                manifest_checksum = bundle.checksum(seed)
+                epoch = new_id("epoch")
+                reports: list[ParticipantReport] = []
+                try:
+                    await self.begin_control(epoch, bundle, seed)
+                    for participant in self.participants.values():
+                        await participant.prepare(epoch)
+                    for name, participant in self.participants.items():
+                        payload = bundle.payloads[name]
+                        checksum = sha256_hex(payload)
+                        report = await participant.load(
+                            ParticipantLoadRequest(
+                                scenarioEpoch=epoch,
+                                scenarioId=bundle.scenario_id,
+                                scenarioVersion=bundle.version,
+                                randomSeed=seed,
+                                payload=payload,
+                                checksum=checksum,
+                                manifestChecksum=manifest_checksum,
+                            )
                         )
-                    )
-                    if (
-                        report.service != name
-                        or report.checksum != checksum
-                        or report.counts != payload["expectedCounts"]
-                    ):
-                        raise RuntimeError(f"{name} reset verification failed")
-                    if report.schema_version != payload.get("schemaVersion"):
-                        raise RuntimeError(f"{name} reset schemaVersion verification failed")
-                    if report.aliases != payload.get("aliases", {}):
-                        raise RuntimeError(f"{name} reset aliases verification failed")
-                    reports.append(report)
-                for participant in self.participants.values():
-                    await participant.commit(epoch)
-                await self.commit_control(epoch, bundle, seed)
+                        if (
+                            report.service != name
+                            or report.checksum != checksum
+                            or report.counts != payload["expectedCounts"]
+                        ):
+                            raise RuntimeError(f"{name} reset verification failed")
+                        if report.schema_version != payload.get("schemaVersion"):
+                            raise RuntimeError(f"{name} reset schemaVersion verification failed")
+                        if report.aliases != payload.get("aliases", {}):
+                            raise RuntimeError(f"{name} reset aliases verification failed")
+                        reports.append(report)
+                    for participant in self.participants.values():
+                        await participant.commit(epoch)
+                    await self.commit_control(epoch, bundle, seed)
+                except Exception:
+                    await self.recover_interrupted_epoch(epoch)
+                    raise
+                try:
+                    await self.finalize_epoch(epoch)
+                except Exception:
+                    await self.mark_cleanup_failed(epoch)
+                    self.test_mode = "cleanup_error"
+                    raise self.cleanup_unavailable() from None
+                self.test_mode = "active"
+                return ResetResult(
+                    scenarioId=bundle.scenario_id,
+                    version=bundle.version,
+                    randomSeed=seed,
+                    scenarioEpoch=epoch,
+                    manifestChecksum=manifest_checksum,
+                    reports=reports,
+                )
             except asyncio.CancelledError:
                 await self.compensate_cancellation(epoch)
                 raise
-            except Exception:
-                await self.recover_interrupted_epoch(epoch)
-                raise
-            try:
-                await self.finalize_epoch(epoch)
-            except Exception:
-                await self.mark_cleanup_failed(epoch)
-                self.test_mode = "cleanup_error"
-                raise self.cleanup_unavailable() from None
-            self.test_mode = "active"
-            return ResetResult(
-                scenarioId=bundle.scenario_id,
-                version=bundle.version,
-                randomSeed=seed,
-                scenarioEpoch=epoch,
-                manifestChecksum=manifest_checksum,
-                reports=reports,
-            )
 
 
 def derive_seed(scenario_id: str, version: int) -> int:

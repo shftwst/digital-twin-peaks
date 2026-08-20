@@ -621,6 +621,34 @@ async def test_duplicate_fault_emits_two_copies_but_keeps_one_lease_attempt(
 
 
 @pytest.mark.asyncio
+async def test_delivery_worker_rejects_an_unsupported_effect_without_sending_or_delivering(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = await initialise_relay(db)
+    await create_subscription_and_event(repository)
+    requests: list[httpx.Request] = []
+
+    async def receive(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(receive)) as client:
+        worker = WebhookWorker(
+            repository,
+            Clock(decision=FaultDecision(effect=FaultEffect.FAILED_REFUND)),
+            client,
+        )
+        with pytest.raises(RuntimeError, match="unsupported webhook delivery fault"):
+            await worker.run_once()
+
+    assert requests == []
+    async with db() as session:
+        delivery = await session.scalar(select(Delivery))
+    assert delivery is not None
+    assert delivery.state != "delivered"
+
+
+@pytest.mark.asyncio
 async def test_duplicate_fault_records_acknowledgement_when_either_copy_succeeds(
     db: async_sessionmaker[AsyncSession],
 ) -> None:

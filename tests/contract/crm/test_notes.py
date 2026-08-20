@@ -10,6 +10,8 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Protocol
 
+import httpx
+import jwt
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import func, select, text
@@ -18,6 +20,7 @@ from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Scope
 
 from enterprise_twins.common.auth.claims import Principal
+from enterprise_twins.common.auth.verifier import JwtVerifier
 from enterprise_twins.common.canonical import canonical_json
 from enterprise_twins.common.control.contracts import ClockValue, FaultDecision, FaultEffect
 from enterprise_twins.common.control.participant import ResetParticipant
@@ -27,12 +30,16 @@ from enterprise_twins.common.db.records import (
     OutboxRecord,
     ScenarioState,
 )
+from enterprise_twins.common.events.relay_client import RelayClient
 from enterprise_twins.common.http.context import RequestContext, current_request
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
+from enterprise_twins.services.crm.app import create_crm_app
 from enterprise_twins.services.crm.models import Customer, CustomerNote
 from enterprise_twins.services.crm.scenario import CrmScenarioLoader
 from enterprise_twins.services.crm.schemas import NoteCreate
 from enterprise_twins.services.crm.service import CrmService
+from enterprise_twins.services.crm.settings import CrmSettings
+from enterprise_twins.services.identity.issuer import TokenIssuer
 
 
 class ControlState(Protocol):
@@ -465,6 +472,84 @@ async def test_webhook_delete_validates_if_match_before_relay_availability(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("relay_failure", ["private_401", "malformed_400"])
+async def test_crm_webhook_proxy_translates_private_relay_failures_to_public_503(
+    crm_harness: CrmHarness,
+    db: async_sessionmaker[AsyncSession],
+    relay_failure: str,
+) -> None:
+    async def relay_response(_request: httpx.Request) -> httpx.Response:
+        if relay_failure == "private_401":
+            return httpx.Response(
+                401,
+                json={
+                    "error": {
+                        "code": "unauthenticated",
+                        "message": "private relay credential marker",
+                        "retryable": False,
+                        "requestId": "private-relay-request",
+                        "details": {"private": "marker"},
+                    }
+                },
+            )
+        return httpx.Response(400, content=b'{"private":"relay-marker"')
+
+    issuer = TokenIssuer(
+        "http://identity:8000",
+        "enterprise-twins",
+        "identity-test-signing-seed",
+        600,
+    )
+    settings = CrmSettings(
+        database_url="postgresql+asyncpg://unused",
+        cursor_secret="crm-test-cursor",
+    )
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(relay_response)) as relay_http,
+        httpx.AsyncClient() as verification_http,
+    ):
+        verifier = JwtVerifier(
+            settings.identity_issuer_aliases,
+            settings.identity_audience,
+            settings.identity_jwks_url,
+            crm_harness.control,  # type: ignore[arg-type]
+            verification_http,
+        )
+        verifier.keys[issuer.kid] = jwt.PyJWK.from_dict(issuer.public_jwk, algorithm="EdDSA")
+        relay = RelayClient("http://relay", "crm", "source-secret", relay_http)
+        app = create_crm_app(
+            db,
+            settings,
+            crm_harness.control,  # type: ignore[arg-type]
+            verifier,
+            relay,
+        )
+        async with AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://crm:8000",
+        ) as client:
+            response = await client.post(
+                "/v1/webhook-subscriptions",
+                headers=crm_harness.support_headers
+                | {
+                    "X-Correlation-Id": "private-relay-crm",
+                    "Idempotency-Key": "private-relay-crm",
+                },
+                json={
+                    "eventTypes": ["crm.note.created"],
+                    "targetUrl": "http://webhook-receiver/events",
+                },
+            )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "temporarily_unavailable"
+    assert response.json()["error"]["retryable"] is True
+    assert response.json()["error"]["message"] == "event relay is temporarily unavailable"
+    assert "private" not in response.text
+    assert "relay-marker" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_note_write_requires_local_active_mode_and_matching_control_epoch(
     crm_harness: CrmHarness,
     db: async_sessionmaker[AsyncSession],
@@ -581,6 +666,26 @@ async def test_after_commit_malformed_response_replays_the_committed_result(
     assert replay.status_code == 201
     assert replay.headers["Idempotency-Replayed"] == "true"
     assert replay.json()["body"] == "committed despite response"
+    assert await count(db, CustomerNote) == 2
+    assert await count(db, IdempotencyRecord) == 1
+    assert await count(db, OutboxRecord) == 1
+
+
+@pytest.mark.asyncio
+async def test_after_commit_timeout_effect_returns_the_committed_result_after_delay(
+    crm_harness: CrmHarness,
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    crm_harness.control.decision = FaultDecision(effect=FaultEffect.TIMEOUT, delayMs=1)
+    response = await crm_harness.client.post(
+        "/v1/customers/cus_unique/notes",
+        headers=crm_harness.support_headers
+        | {"Idempotency-Key": "note-timeout-effect", "If-Match": '"1"'},
+        json={"body": "committed before timeout", "association": "account"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["body"] == "committed before timeout"
     assert await count(db, CustomerNote) == 2
     assert await count(db, IdempotencyRecord) == 1
     assert await count(db, OutboxRecord) == 1

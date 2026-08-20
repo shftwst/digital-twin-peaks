@@ -27,7 +27,11 @@ def relay_router(
     def authorise(source: str, authorization: str | None) -> None:
         expected = settings.source_tokens.get(source, "")
         supplied = parse_bearer(authorization)
-        if not expected or supplied is None or not hmac.compare_digest(expected, supplied):
+        if (
+            not expected
+            or supplied is None
+            or not hmac.compare_digest(expected.encode("ascii"), supplied.encode("ascii"))
+        ):
             raise ApiError(
                 ErrorCode.UNAUTHENTICATED,
                 "invalid source credential",

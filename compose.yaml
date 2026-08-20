@@ -6,12 +6,34 @@ x-common-environment: &common-environment
 x-twin-service: &twin-service
   build:
     context: .
+  restart: on-failure
   environment: *common-environment
   depends_on:
     postgres:
       condition: service_healthy
 
 services:
+  endpoint-manifest:
+    build:
+      context: .
+    command:
+      - enterprise_twins.endpoint_manifest
+      - --output
+      - /output/manifest-v1.json
+      - --identity-container-url
+      - http://identity:8000
+      - --identity-loopback-url
+      - http://127.0.0.1:8101
+      - --crm-container-url
+      - http://crm:8000
+      - --crm-loopback-url
+      - http://127.0.0.1:8102
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    volumes:
+      - ./artifacts/endpoints:/output
+
   postgres:
     image: postgres:18-alpine
     environment:
@@ -151,6 +173,8 @@ services:
         condition: service_started
       control:
         condition: service_healthy
+      event-relay-worker:
+        condition: service_healthy
     healthcheck: *public-health
     networks: [twin-integration, twin-control]
 
@@ -163,8 +187,11 @@ services:
         condition: service_healthy
       control:
         condition: service_healthy
-      event-relay-api:
-        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "enterprise_twins.services.relay.worker_health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
     networks: [twin-integration, twin-webhook-egress, twin-control]
 
   identity:
@@ -178,6 +205,8 @@ services:
       TWINS_DATABASE_URL: postgresql+asyncpg://identity_user:identity_local_only@postgres/identity
       TWINS_IDENTITY_DATABASE_URL: postgresql+asyncpg://identity_user:identity_local_only@postgres/identity
       TWINS_IDENTITY_ISSUER: http://identity:8000
+      TWINS_IDENTITY_ISSUER_ALIASES: >-
+        ["http://identity:8000","http://127.0.0.1:8101"]
       TWINS_IDENTITY_AUDIENCE: enterprise-twins
       TWINS_IDENTITY_SIGNING_SEED: identity-test-signing-seed
       TWINS_IDENTITY_SECRET_PEPPER: identity-local-pepper
@@ -195,6 +224,8 @@ services:
         condition: service_healthy
       event-relay-api:
         condition: service_healthy
+      endpoint-manifest:
+        condition: service_completed_successfully
     healthcheck: *public-health
     ports: ["127.0.0.1:8101:8000"]
     networks: [twin-public, twin-integration, twin-control]
@@ -211,6 +242,8 @@ services:
       TWINS_CRM_DATABASE_URL: postgresql+asyncpg://crm_user:crm_local_only@postgres/crm
       TWINS_CRM_CURSOR_SECRET: crm-local-cursor-secret
       TWINS_CRM_IDENTITY_ISSUER: http://identity:8000
+      TWINS_CRM_IDENTITY_ISSUER_ALIASES: >-
+        ["http://identity:8000","http://127.0.0.1:8101"]
       TWINS_CRM_IDENTITY_JWKS_URL: http://identity:8000/.well-known/jwks.json
       TWINS_CRM_IDENTITY_AUDIENCE: enterprise-twins
       TWINS_CRM_CONTROL_URL: http://control:8000
@@ -228,6 +261,8 @@ services:
         condition: service_healthy
       event-relay-api:
         condition: service_healthy
+      endpoint-manifest:
+        condition: service_completed_successfully
     healthcheck: *public-health
     ports: ["127.0.0.1:8102:8000"]
     networks: [twin-public, twin-integration, twin-control]

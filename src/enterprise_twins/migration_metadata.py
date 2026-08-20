@@ -32,6 +32,7 @@ SERVICE_TABLES = {
         "relay_source_events",
         "relay_deliveries",
         "relay_delivery_attempts",
+        "relay_worker_heartbeat",
     },
     "identity": {
         "scenario_state",

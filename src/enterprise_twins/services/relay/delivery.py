@@ -1,7 +1,8 @@
 import asyncio
 import hashlib
 import hmac
-from datetime import datetime
+from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Protocol
 
 import httpx
@@ -16,6 +17,7 @@ from enterprise_twins.common.control.contracts import (
     FaultPhase,
     FaultProbe,
 )
+from enterprise_twins.common.control.fault_capabilities import FAULT_CAPABILITIES
 from enterprise_twins.common.db.runtime import make_engine, make_session_factory
 from enterprise_twins.common.http.errors import ApiError
 from enterprise_twins.services.relay.repository import RelayRepository
@@ -72,6 +74,11 @@ class WebhookWorker:
                 correlationId=event.envelope["correlationId"],
             )
         )
+        supported_effects = FAULT_CAPABILITIES[
+            ("event-relay", "webhook.deliver", FaultPhase.EVENT_DELIVERY)
+        ]
+        if decision.effect is not None and decision.effect not in supported_effects:
+            raise RuntimeError("unsupported webhook delivery fault effect")
         if decision.effect is not None:
             handled = await self.repository.apply_delivery_fault(delivery, decision, now)
             if handled:
@@ -125,6 +132,20 @@ class WebhookWorker:
         return 1
 
 
+async def run_worker_iteration(
+    worker: WebhookWorker,
+    *,
+    wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> int:
+    try:
+        processed = await worker.run_once()
+    except ApiError, httpx.HTTPError, SQLAlchemyError:
+        await worker.repository.record_worker_heartbeat(wall_clock(), ready=False)
+        return 0
+    await worker.repository.record_worker_heartbeat(wall_clock(), ready=True)
+    return processed
+
+
 async def main() -> None:
     settings = RelaySettings()  # type: ignore[call-arg]
     engine = make_engine(settings.database_url)
@@ -138,10 +159,7 @@ async def main() -> None:
         )
         try:
             while True:
-                try:
-                    processed = await worker.run_once()
-                except ApiError, RuntimeError, httpx.HTTPError, SQLAlchemyError:
-                    processed = 0
+                processed = await run_worker_iteration(worker)
                 if processed == 0:
                     await asyncio.sleep(0.05)
         finally:

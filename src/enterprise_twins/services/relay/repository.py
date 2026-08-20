@@ -2,6 +2,7 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from typing import cast
 
 from pydantic import AnyHttpUrl
 from sqlalchemy import or_, select
@@ -30,6 +31,7 @@ from enterprise_twins.services.relay.models import (
     DeliveryAttempt,
     SourceEvent,
     Subscription,
+    WorkerHeartbeat,
 )
 
 
@@ -41,6 +43,24 @@ class RelayRepository:
     ) -> None:
         self.factory = factory
         self.allowed_targets = allowed_targets
+
+    async def record_worker_heartbeat(self, observed_at: datetime, *, ready: bool) -> None:
+        async with self.factory.begin() as session:
+            await session.execute(
+                insert(WorkerHeartbeat)
+                .values(singleton_id=1, observed_at=observed_at, ready=ready)
+                .on_conflict_do_update(
+                    index_elements=[WorkerHeartbeat.singleton_id],
+                    set_={"observed_at": observed_at, "ready": ready},
+                )
+            )
+
+    async def worker_heartbeat(self) -> WorkerHeartbeat | None:
+        async with self.factory() as session:
+            return cast(
+                WorkerHeartbeat | None,
+                await session.get(WorkerHeartbeat, 1),
+            )
 
     async def active_epoch(
         self,
@@ -263,8 +283,10 @@ class RelayRepository:
                 .where(ScenarioState.singleton_id == 1)
                 .with_for_update(read=True)
             )
-            if state is None or state.mode != "active":
-                raise RuntimeError("relay scenario is not active")
+            if state is None:
+                raise RuntimeError("relay scenario is not initialised")
+            if state.mode != "active":
+                return None
             epoch = state.active_epoch
             delivery = await session.scalar(
                 select(Delivery)

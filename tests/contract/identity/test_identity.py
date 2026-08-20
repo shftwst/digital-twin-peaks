@@ -1,6 +1,7 @@
 # ruff: noqa: S105, S106
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
@@ -16,6 +17,7 @@ from enterprise_twins.common.canonical import sha256_hex
 from enterprise_twins.common.control.contracts import (
     ClockValue,
     FaultDecision,
+    FaultEffect,
     ParticipantLoadRequest,
 )
 from enterprise_twins.common.control.participant import ResetParticipant
@@ -258,6 +260,107 @@ async def test_client_credentials_jwks_and_self_view(
 
 
 @pytest.mark.asyncio
+async def test_discovery_and_token_issuer_follow_only_the_configured_request_authority(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = IdentitySettings(
+        database_url="postgresql+asyncpg://unused",
+        issuer="http://identity:8000",
+        issuer_aliases=("http://identity:8000", "http://127.0.0.1:8101"),
+        audience="enterprise-twins",
+        signing_seed="identity-test-signing-seed",
+        secret_pepper="identity-test-pepper",
+        token_ttl_seconds=600,
+    )
+    async with db.begin() as session:
+        session.add(ScenarioState(singleton_id=1, mode="active", active_epoch="epoch_1"))
+        for index, (client_id, scopes) in enumerate(
+            [
+                ("support-agent", ["crm:read", "crm:notes:write"]),
+                ("webhook-manager", ["webhooks:manage", "crm:read"]),
+            ]
+        ):
+            session.add(
+                IdentityClient(
+                    row_id=f"irow_authority_{index}",
+                    scenario_epoch="epoch_1",
+                    client_id=client_id,
+                    secret_digest=digest_secret(
+                        client_id,
+                        "client-secret",
+                        settings.secret_pepper,
+                    ),
+                    subject=f"subject-{index}",
+                    actor_type="service",
+                    role="integration_service",
+                    scopes=scopes,
+                    tenant_id="tenant_synthetic",
+                    active=True,
+                    version=1,
+                )
+            )
+    app = create_identity_app(db, settings, Clock())
+
+    for origin in settings.issuer_aliases:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=origin) as client:
+            metadata = await client.get(
+                "/.well-known/openid-configuration",
+                headers={
+                    "Forwarded": "host=attacker.example;proto=https",
+                    "X-Forwarded-Host": "attacker.example",
+                    "X-Forwarded-Proto": "https",
+                },
+            )
+            token_response = await client.post(
+                metadata.json()["token_endpoint"],
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": "support-agent",
+                    "client_secret": "client-secret",
+                    "scope": "crm:read",
+                },
+            )
+            claims = jwt.decode(
+                token_response.json()["access_token"],
+                options={"verify_signature": False},
+            )
+
+        assert metadata.status_code == 200
+        assert metadata.json() == {
+            "issuer": origin,
+            "token_endpoint": f"{origin}/oauth/token",
+            "jwks_uri": f"{origin}/.well-known/jwks.json",
+            "grant_types_supported": ["client_credentials"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post"],
+            "scopes_supported": ["crm:notes:write", "crm:read", "webhooks:manage"],
+        }
+        assert token_response.status_code == 200
+        assert claims["iss"] == origin
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://localhost:8101",
+    ) as client:
+        unknown_discovery = await client.get("/.well-known/openid-configuration")
+        unknown_token = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": "support-agent",
+                "client_secret": "client-secret",
+            },
+        )
+        duplicate_host = await client.get(
+            "/.well-known/openid-configuration",
+            headers=[("Host", "identity:8000"), ("Host", "127.0.0.1:8101")],
+        )
+
+    for response in (unknown_discovery, unknown_token, duplicate_host):
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.asyncio
 async def test_wrong_secret_and_ungranted_scope_are_denied(
     identity_client: AsyncClient,
 ) -> None:
@@ -315,6 +418,95 @@ async def test_token_business_call_reports_control_outage_as_retryable_503(
     assert response.json()["error"]["code"] == "temporarily_unavailable"
     assert response.json()["error"]["retryable"] is True
     assert "sensitive-secret" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "effect",
+    [FaultEffect.TEMPORARY_FAILURE, FaultEffect.TIMEOUT],
+)
+async def test_token_issue_exercises_every_registered_identity_fault_effect(
+    db: async_sessionmaker[AsyncSession],
+    effect: FaultEffect,
+) -> None:
+    probes: list[object] = []
+
+    class FaultControl(Clock):
+        async def evaluate_fault(self, probe: object) -> FaultDecision:
+            probes.append(probe)
+            return FaultDecision(
+                effect=effect,
+                delayMs=10 if effect == FaultEffect.TIMEOUT else None,
+            )
+
+    settings = IdentitySettings(
+        database_url="postgresql+asyncpg://unused",
+        secret_pepper="identity-test-pepper",
+    )
+    async with db.begin() as session:
+        session.add(ScenarioState(singleton_id=1, mode="active", active_epoch="epoch_1"))
+    app = create_identity_app(db, settings, FaultControl())
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://identity:8000"
+    ) as client:
+        started = time.monotonic()
+        response = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": "support-agent",
+                "client_secret": "support-secret",
+            },
+        )
+        elapsed = time.monotonic() - started
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "temporarily_unavailable"
+    assert len(probes) == 1
+    if effect == FaultEffect.TIMEOUT:
+        assert elapsed >= 0.01
+
+
+@pytest.mark.asyncio
+async def test_token_issue_rejects_an_unexpected_non_null_fault_decision(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    class InvalidFaultControl(Clock):
+        def __init__(self) -> None:
+            self.snapshot_calls = 0
+
+        async def evaluate_fault(self, probe: object) -> FaultDecision:
+            return FaultDecision(effect=FaultEffect.FAILED_REFUND)
+
+        async def snapshot(self) -> ClockValue:
+            self.snapshot_calls += 1
+            return await super().snapshot()
+
+    settings = IdentitySettings(
+        database_url="postgresql+asyncpg://unused",
+        secret_pepper="identity-test-pepper",
+    )
+    async with db.begin() as session:
+        session.add(ScenarioState(singleton_id=1, mode="active", active_epoch="epoch_1"))
+    control = InvalidFaultControl()
+    app = create_identity_app(db, settings, control)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://identity:8000",
+    ) as client:
+        response = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": "support-agent",
+                "client_secret": "support-secret",
+            },
+        )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert control.snapshot_calls == 0
 
 
 @pytest.mark.asyncio
@@ -384,6 +576,89 @@ async def test_webhook_delete_rejects_noncanonical_if_match_before_relay_work(
                 assert response.json()["error"]["code"] == "invalid_request"
 
     assert relay_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relay_failure", ["private_401", "malformed_400"])
+async def test_identity_webhook_proxy_translates_private_relay_failures_to_public_503(
+    db: async_sessionmaker[AsyncSession],
+    relay_failure: str,
+) -> None:
+    settings = IdentitySettings(
+        database_url="postgresql+asyncpg://unused",
+        signing_seed="identity-test-signing-seed",
+        secret_pepper="identity-test-pepper",
+    )
+    async with db.begin() as session:
+        session.add(ScenarioState(singleton_id=1, mode="active", active_epoch="epoch_1"))
+        session.add(
+            IdentityClient(
+                row_id="irow_private_relay",
+                scenario_epoch="epoch_1",
+                client_id="webhook-manager",
+                secret_digest=digest_secret(
+                    "webhook-manager", "manager-secret", settings.secret_pepper
+                ),
+                subject="person-support-1",
+                actor_type="human",
+                role="support_agent",
+                scopes=["webhooks:manage"],
+                tenant_id="tenant_synthetic",
+                active=True,
+                version=1,
+            )
+        )
+
+    async def relay_response(_request: httpx.Request) -> httpx.Response:
+        if relay_failure == "private_401":
+            return httpx.Response(
+                401,
+                json={
+                    "error": {
+                        "code": "unauthenticated",
+                        "message": "private relay credential marker",
+                        "retryable": False,
+                        "requestId": "private-relay-request",
+                        "details": {"private": "marker"},
+                    }
+                },
+            )
+        return httpx.Response(400, content=b'{"private":"relay-marker"')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(relay_response)) as relay_http:
+        relay = RelayClient("http://relay", "identity", "source-secret", relay_http)
+        app = create_identity_app(db, settings, Clock(), relay)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://identity:8000"
+        ) as client:
+            token_response = await client.post(
+                "/oauth/token",
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": "webhook-manager",
+                    "client_secret": "manager-secret",
+                    "scope": "webhooks:manage",
+                },
+            )
+            response = await client.post(
+                "/v1/webhook-subscriptions",
+                headers={
+                    "Authorization": f"Bearer {token_response.json()['access_token']}",
+                    "X-Correlation-Id": "private-relay-identity",
+                    "Idempotency-Key": "private-relay-identity",
+                },
+                json={
+                    "eventTypes": ["identity.token.issued"],
+                    "targetUrl": "http://webhook-receiver/events",
+                },
+            )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "temporarily_unavailable"
+    assert response.json()["error"]["retryable"] is True
+    assert response.json()["error"]["message"] == "event relay is temporarily unavailable"
+    assert "private" not in response.text
+    assert "relay-marker" not in response.text
 
 
 @pytest.mark.asyncio

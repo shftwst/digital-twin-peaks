@@ -1,5 +1,9 @@
 # Enterprise digital twins implementation programme
 
+The numbered plans below are technical increments within refund Release 1,
+not separate business releases. Supplier onboarding is the second future
+business release.
+
 Status: Approved design split into executable plans  
 Date: 2026-08-19  
 Design: [Enterprise digital twins for refund workflows](../specs/2026-08-19-enterprise-digital-twins-design.md)
@@ -68,4 +72,3 @@ explanation, or workflow completion into a twin.
 | Per-plan | Contract tests and a black-box proof against running containers |
 | Cross-system | Only documented integrations, signed events, duplicate handling, and source-resource reconciliation |
 | Estate | The acceptance criteria in the approved design and no database access from public tests |
-

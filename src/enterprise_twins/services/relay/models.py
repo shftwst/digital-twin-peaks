@@ -60,3 +60,11 @@ class DeliveryAttempt(ScenarioOwned, Base):
     response_status: Mapped[int | None] = mapped_column(Integer)
     outcome: Mapped[str] = mapped_column(String(40))
     resulting_next_attempt_at: Mapped[datetime | None] = mapped_column(Timestamp)
+
+
+class WorkerHeartbeat(Base):
+    __tablename__ = "relay_worker_heartbeat"
+
+    singleton_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    observed_at: Mapped[datetime] = mapped_column(Timestamp)
+    ready: Mapped[bool] = mapped_column(Boolean, nullable=False)

@@ -15,6 +15,10 @@ from enterprise_twins.common.control.contracts import (
     FaultProbe,
     FaultRuleCreate,
 )
+from enterprise_twins.common.control.fault_capabilities import (
+    FAULT_CAPABILITIES,
+    PHASE_EFFECTS,
+)
 from enterprise_twins.common.db.records import ScenarioState
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
 from enterprise_twins.services.control.app import create_control_app
@@ -59,6 +63,192 @@ def fault_probe(**overrides: object) -> FaultProbe:
     }
     values.update(overrides)
     return FaultProbe.model_validate(values)
+
+
+def test_fault_phase_effect_matrix_and_plan_one_capabilities_are_exact() -> None:
+    expected_matrix = {
+        (FaultPhase.BEFORE_VALIDATION, FaultEffect.MALFORMED_TRANSPORT),
+        (FaultPhase.BEFORE_VALIDATION, FaultEffect.UNAUTHENTICATED),
+        (FaultPhase.BEFORE_VALIDATION, FaultEffect.RATE_LIMITED),
+        (FaultPhase.BEFORE_COMMIT, FaultEffect.TEMPORARY_FAILURE),
+        (FaultPhase.BEFORE_COMMIT, FaultEffect.DELAY),
+        (FaultPhase.BEFORE_COMMIT, FaultEffect.TIMEOUT),
+        (FaultPhase.AFTER_COMMIT, FaultEffect.TIMEOUT),
+        (FaultPhase.AFTER_COMMIT, FaultEffect.CONNECTION_LOSS),
+        (FaultPhase.AFTER_COMMIT, FaultEffect.MALFORMED_RESPONSE),
+        (FaultPhase.READ, FaultEffect.STALE_VERSION),
+        (FaultPhase.READ, FaultEffect.TEMPORARY_ABSENCE),
+        (FaultPhase.READ, FaultEffect.PAGINATION_CHANGE),
+        (FaultPhase.EVENT_DELIVERY, FaultEffect.DELAY),
+        (FaultPhase.EVENT_DELIVERY, FaultEffect.DUPLICATE),
+        (FaultPhase.EVENT_DELIVERY, FaultEffect.REORDER),
+        (FaultPhase.EVENT_DELIVERY, FaultEffect.SUPPRESS),
+        (FaultPhase.EVENT_DELIVERY, FaultEffect.RETRY),
+        (FaultPhase.DOMAIN_COMPLETION, FaultEffect.FAILED_REFUND),
+        (FaultPhase.DOMAIN_COMPLETION, FaultEffect.DELAYED_SETTLEMENT),
+        (FaultPhase.DOMAIN_COMPLETION, FaultEffect.BOUNCE),
+        (FaultPhase.DOMAIN_COMPLETION, FaultEffect.DEFER),
+        (FaultPhase.DOMAIN_COMPLETION, FaultEffect.DROP),
+    }
+    expected_capabilities = {
+        ("identity", "identity.token.issue", FaultPhase.BEFORE_COMMIT): frozenset(
+            {FaultEffect.TEMPORARY_FAILURE, FaultEffect.TIMEOUT}
+        ),
+        ("crm", "crm.note.create", FaultPhase.AFTER_COMMIT): frozenset(
+            {
+                FaultEffect.TIMEOUT,
+                FaultEffect.CONNECTION_LOSS,
+                FaultEffect.MALFORMED_RESPONSE,
+            }
+        ),
+        ("event-relay", "webhook.deliver", FaultPhase.EVENT_DELIVERY): frozenset(
+            {
+                FaultEffect.DELAY,
+                FaultEffect.DUPLICATE,
+                FaultEffect.REORDER,
+                FaultEffect.SUPPRESS,
+                FaultEffect.RETRY,
+            }
+        ),
+    }
+
+    assert {
+        (phase, effect) for phase, effects in PHASE_EFFECTS.items() for effect in effects
+    } == expected_matrix
+    assert FAULT_CAPABILITIES == expected_capabilities
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"targetService": "unknown"},
+        {"operation": "crm.note.unknown"},
+        {"phase": FaultPhase.READ, "effect": FaultEffect.STALE_VERSION},
+        {"phase": FaultPhase.AFTER_COMMIT, "effect": FaultEffect.FAILED_REFUND},
+        {
+            "targetService": "identity",
+            "operation": "identity.token.issue",
+            "phase": FaultPhase.AFTER_COMMIT,
+        },
+        {
+            "targetService": "identity",
+            "operation": "identity.token.issue",
+            "phase": FaultPhase.BEFORE_COMMIT,
+            "effect": FaultEffect.DELAY,
+        },
+    ],
+)
+async def test_unsupported_fault_rule_returns_422_without_storing_or_activating(
+    db: async_sessionmaker[AsyncSession],
+    overrides: dict[str, object],
+) -> None:
+    await initialise_control(db)
+    app = create_control_app(db, fault_settings())
+    payload = fault_rule(**overrides).model_dump(mode="json", by_alias=True)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://control") as client:
+        response = await client.post(
+            "/control/v1/faults",
+            headers={"Authorization": "Bearer controller-secret-token"},
+            json=payload,
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    async with db() as session:
+        assert await session.scalar(select(func.count()).select_from(FaultRule)) == 0
+        assert await session.scalar(select(func.count()).select_from(FaultActivation)) == 0
+
+
+@pytest.mark.asyncio
+async def test_every_plan_one_fault_capability_can_be_created(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    await initialise_control(db)
+    repository = FaultRepository(db)
+
+    for (target, operation, phase), effects in FAULT_CAPABILITIES.items():
+        for effect in effects:
+            await repository.create(
+                fault_rule(
+                    ruleId=f"{target}-{phase.value}-{effect.value}",
+                    targetService=target,
+                    operation=operation,
+                    phase=phase,
+                    effect=effect,
+                )
+            )
+
+    async with db() as session:
+        assert await session.scalar(select(func.count()).select_from(FaultRule)) == 10
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"targetService": "unknown"},
+        {"operation": "crm.note.unknown"},
+        {"phase": FaultPhase.READ},
+    ],
+)
+async def test_unsupported_fault_probe_returns_422_without_database_activation(
+    db: async_sessionmaker[AsyncSession],
+    overrides: dict[str, object],
+) -> None:
+    await initialise_control(db)
+    app = create_control_app(db, fault_settings())
+    payload = fault_probe(**overrides).model_dump(mode="json", by_alias=True)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://control") as client:
+        response = await client.post(
+            "/control/v1/faults/evaluate",
+            headers={"Authorization": "Bearer twin-secret-token"},
+            json=payload,
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    async with db() as session:
+        assert await session.scalar(select(func.count()).select_from(FaultActivation)) == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluation_rejects_an_invalid_persisted_effect_without_consuming_it(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    await initialise_control(db)
+    async with db.begin() as session:
+        session.add(
+            FaultRule(
+                rule_id="invalid-stored-effect",
+                scenario_epoch="epoch_1",
+                target_service="crm",
+                operation="crm.note.create",
+                phase=FaultPhase.AFTER_COMMIT.value,
+                effect=FaultEffect.FAILED_REFUND.value,
+                actor_id=None,
+                resource_id=None,
+                correlation_id=None,
+                request_hash=None,
+                occurrence=1,
+                seen_count=0,
+                remaining_count=1,
+                delay_ms=None,
+                response_data={},
+            )
+        )
+
+    with pytest.raises(ApiError) as raised:
+        await FaultRepository(db).evaluate(fault_probe())
+
+    assert raised.value.code == ErrorCode.INVALID_REQUEST
+    assert raised.value.status_code == 422
+    async with db() as session:
+        rule = await session.get(FaultRule, "invalid-stored-effect")
+        assert rule is not None
+        assert rule.seen_count == 0
+        assert rule.remaining_count == 1
+        assert await session.scalar(select(func.count()).select_from(FaultActivation)) == 0
 
 
 async def wait_for_lock_waiters(

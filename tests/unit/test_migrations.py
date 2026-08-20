@@ -28,6 +28,7 @@ from enterprise_twins import migration_metadata, runtime
                 "relay_delivery_attempts",
                 "relay_source_events",
                 "relay_subscriptions",
+                "relay_worker_heartbeat",
                 "scenario_state",
             },
         ),

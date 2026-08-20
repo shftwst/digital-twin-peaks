@@ -19,6 +19,13 @@ from typing import Any, cast
 import httpx
 
 from enterprise_twins.common.canonical import canonical_json
+from enterprise_twins.topology import (
+    NETWORK_INTERNAL,
+    PLAN_ONE_SERVICE_NETWORKS,
+    PRIVATE_PROBE_TARGETS,
+    validate_compose_topology,
+)
+from enterprise_twins.topology import validate_network_evidence as validate_topology_evidence
 
 JsonObject = dict[str, Any]
 Transcript = list[dict[str, object]]
@@ -146,19 +153,6 @@ SUMMARY_BY_MODE: dict[str, JsonObject] = {
         "resetContract": "passed",
         "networkIsolation": "passed",
     },
-}
-EXPECTED_PROFILE_NETWORKS = {
-    "webhook-receiver": ["conformance-admin", "twin-webhook-egress"],
-    "conformance": ["conformance-admin", "twin-control", "twin-public"],
-    "public-probe": ["twin-public"],
-}
-EXPECTED_NETWORK_ASSERTIONS = {
-    "controlNotPublished": True,
-    "conformanceHasNoDatabaseUrl": True,
-    "dockerSocketAbsent": True,
-    "driverOffWebhookEgress": True,
-    "receiverOffControl": True,
-    "publicProbeCannotResolveControl": True,
 }
 
 
@@ -1005,27 +999,7 @@ def parse_utc_rfc3339(value: object, name: str) -> datetime:
 
 
 def validate_network_evidence(network: JsonObject) -> None:
-    assertions = network.get("assertions")
-    assertions_valid = (
-        isinstance(assertions, dict)
-        and set(assertions) == set(EXPECTED_NETWORK_ASSERTIONS)
-        and all(value is True for value in assertions.values())
-    )
-    if (
-        set(network)
-        != {
-            "runId",
-            "composeNetworks",
-            "runtimeNetworks",
-            "hostBindings",
-            "assertions",
-        }
-        or network.get("composeNetworks") != EXPECTED_PROFILE_NETWORKS
-        or network.get("runtimeNetworks") != EXPECTED_PROFILE_NETWORKS
-        or network.get("hostBindings") != {service: {} for service in EXPECTED_PROFILE_NETWORKS}
-        or not assertions_valid
-    ):
-        raise AssertionError("network evidence does not match the isolated profile contract")
+    validate_topology_evidence(network)
 
 
 def operation_actuals(calls: list[JsonObject], operation: str) -> list[JsonObject]:
@@ -2897,66 +2871,126 @@ def record_network_proof(artifact_root: Path, run_id: str) -> None:
     configuration = json.loads(
         run_command([docker, "compose", "--profile", "test", "config", "--format", "json"]).stdout
     )
-    services = cast(dict[str, JsonObject], configuration["services"])
-    expected = {
-        "webhook-receiver": {"conformance-admin", "twin-webhook-egress"},
-        "conformance": {"conformance-admin", "twin-control", "twin-public"},
-        "public-probe": {"twin-public"},
-    }
-    static_networks = {name: set(services[name]["networks"]) for name in expected}
-    if static_networks != expected:
-        raise AssertionError("profile service Compose network memberships differ")
-    if services["control"].get("ports"):
-        raise AssertionError("Control has a host port binding")
-    environment = services["conformance"].get("environment", {})
-    if "DATABASE_URL" in json.dumps(environment).upper():
-        raise AssertionError("conformance service receives a database URL")
-    if any(
-        "/var/run/docker.sock" in json.dumps(service.get("volumes", []))
-        for service in services.values()
-    ):
-        raise AssertionError("a Compose service mounts the Docker socket")
+    static = validate_compose_topology(configuration)
 
     runtime_networks: dict[str, list[str]] = {}
     host_bindings: dict[str, object] = {}
-    for name, networks in expected.items():
+    inspected_services: dict[str, JsonObject] = {}
+    runtime_network_names: set[str] = set()
+    for name, networks in PLAN_ONE_SERVICE_NETWORKS.items():
         container = run_command([docker, "compose", "ps", "-q", name]).stdout.strip()
         if not container:
             raise AssertionError(f"{name} is not running")
         inspected = inspect_json(docker, container)
+        inspected_services[name] = inspected
+        attached_networks = cast(JsonObject, inspected["NetworkSettings"])["Networks"]
+        if not isinstance(attached_networks, dict):
+            raise AssertionError(f"{name} runtime networks are invalid")
+        runtime_network_names.update(attached_networks)
         actual_networks = {
             value["Labels"]["com.docker.compose.network"]
-            for network_name in cast(JsonObject, inspected["NetworkSettings"])["Networks"]
+            for network_name in attached_networks
             for value in json.loads(
                 run_command([docker, "network", "inspect", str(network_name)]).stdout
             )
         }
-        if actual_networks != networks:
+        if actual_networks != set(networks):
             raise AssertionError(f"{name} runtime networks differ")
         runtime_networks[name] = sorted(actual_networks)
         bindings = cast(JsonObject, inspected["HostConfig"])["PortBindings"]
-        if bindings:
-            raise AssertionError(f"{name} has a host port binding")
-        host_bindings[name] = bindings
-    probe = run_command(
-        [docker, "compose", "run", "--rm", "public-probe", "sh", "-c", "! getent hosts control"]
+        host_bindings[name] = bindings or {}
+
+    runtime_internal: dict[str, bool] = {}
+    for network_name in sorted(runtime_network_names):
+        values = json.loads(run_command([docker, "network", "inspect", network_name]).stdout)
+        if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+            raise AssertionError("Docker network inspect returned an unexpected document")
+        labels = values[0].get("Labels")
+        if not isinstance(labels, dict):
+            raise AssertionError("Docker network labels are missing")
+        logical_name = labels.get("com.docker.compose.network")
+        if logical_name in NETWORK_INTERNAL:
+            runtime_internal[logical_name] = values[0].get("Internal") is True
+
+    probe_script = """
+import json
+import socket
+import sys
+
+targets = json.loads(sys.argv[1])
+results = {}
+for host, port in targets.items():
+    try:
+        socket.getaddrinfo(host, port)
+    except OSError:
+        resolved = False
+    else:
+        resolved = True
+    try:
+        connection = socket.create_connection((host, port), timeout=0.5)
+    except OSError:
+        reachable = False
+    else:
+        connection.close()
+        reachable = True
+    results[host] = {"resolved": resolved, "reachable": reachable}
+print(json.dumps(results, sort_keys=True))
+"""
+    public_probe = json.loads(
+        run_command(
+            [
+                docker,
+                "compose",
+                "run",
+                "--rm",
+                "public-probe",
+                "python",
+                "-c",
+                probe_script,
+                json.dumps(PRIVATE_PROBE_TARGETS, sort_keys=True),
+            ]
+        ).stdout
     )
-    if probe.returncode != 0:
-        raise AssertionError("public-only probe resolved Control")
+
+    docker_socket_mounts = sorted(
+        f"{name}:{mount.get('Destination', '')}"
+        for name, inspected in inspected_services.items()
+        for mount in cast(list[JsonObject], inspected.get("Mounts", []))
+        if "/var/run/docker.sock" in json.dumps(mount)
+    )
+    conformance_environment = cast(JsonObject, inspected_services["conformance"]["Config"])["Env"]
+    if not isinstance(conformance_environment, list):
+        raise AssertionError("conformance runtime environment is invalid")
+    database_keys = sorted(
+        value.partition("=")[0]
+        for value in conformance_environment
+        if isinstance(value, str)
+        and (
+            "DATABASE" in value.partition("=")[0].upper()
+            or value.partition("=")[0].upper().startswith("POSTGRES")
+        )
+    )
+    worker_configuration = cast(
+        JsonObject,
+        inspected_services["event-relay-worker"]["Config"],
+    )
+    exposed_ports = sorted(cast(JsonObject, worker_configuration.get("ExposedPorts") or {}))
     payload = {
         "runId": run_id,
-        "composeNetworks": {name: sorted(value) for name, value in static_networks.items()},
+        "composeNetworks": static["composeNetworks"],
         "runtimeNetworks": runtime_networks,
+        "composeNetworkInternal": static["composeNetworkInternal"],
+        "runtimeNetworkInternal": runtime_internal,
         "hostBindings": host_bindings,
-        "assertions": {
-            "controlNotPublished": True,
-            "conformanceHasNoDatabaseUrl": True,
-            "dockerSocketAbsent": True,
-            "driverOffWebhookEgress": True,
-            "receiverOffControl": True,
-            "publicProbeCannotResolveControl": True,
+        "publicProbeIsolation": public_probe,
+        "security": {
+            "dockerSocketMounts": docker_socket_mounts,
+            "conformanceDatabaseEnvironmentKeys": database_keys,
+            "workerExposedPorts": exposed_ports,
         },
+        "workerCommand": worker_configuration.get("Cmd"),
     }
+    validate_topology_evidence(payload)
     check_no_sensitive_values(payload)
     path = artifact_root / "network.json"
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

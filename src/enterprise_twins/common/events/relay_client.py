@@ -1,6 +1,8 @@
 from collections.abc import Awaitable
+from typing import Any
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from enterprise_twins.common.auth.credentials import validate_private_credential
 from enterprise_twins.common.events.contracts import (
@@ -10,6 +12,29 @@ from enterprise_twins.common.events.contracts import (
     WebhookSubscriptionView,
 )
 from enterprise_twins.common.http.errors import ApiError, ErrorCode
+
+
+class PrivateRelayErrorBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    code: str
+    message: str = Field(min_length=1)
+    retryable: StrictBool
+    requestId: str = Field(min_length=1)
+    details: dict[str, Any]
+
+
+class PrivateRelayErrorEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    error: PrivateRelayErrorBody
+
+
+SAFE_RELAY_ERRORS = {
+    (404, ErrorCode.NOT_FOUND): "event relay resource was not found",
+    (409, ErrorCode.CONFLICT): "event relay request conflicts",
+    (422, ErrorCode.INVALID_REQUEST): "event relay request is invalid",
+}
 
 
 def relay_unavailable() -> ApiError:
@@ -29,30 +54,22 @@ def require_relay_success(
     if response.status_code in accepted:
         return
     if response.status_code < 400:
-        raise ApiError(
-            ErrorCode.TEMPORARILY_UNAVAILABLE,
-            "event relay returned an unexpected success status",
-            status_code=503,
-            retryable=True,
-            details={"relayStatus": response.status_code},
-        )
+        raise relay_unavailable()
+    content_type = response.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+    if content_type != "application/json":
+        raise relay_unavailable()
     try:
-        error = response.json()["error"]
-        code = ErrorCode(error["code"])
-        message = str(error["message"])
-        retryable = bool(error.get("retryable", False))
-        details = dict(error.get("details", {}))
-    except KeyError, TypeError, ValueError:
-        code = ErrorCode.TEMPORARILY_UNAVAILABLE
-        message = "event relay returned an invalid error response"
-        retryable = response.status_code >= 500
-        details = {}
+        envelope = PrivateRelayErrorEnvelope.model_validate(response.json())
+        code = ErrorCode(envelope.error.code)
+    except TypeError, ValueError:
+        raise relay_unavailable() from None
+    message = SAFE_RELAY_ERRORS.get((response.status_code, code))
+    if message is None:
+        raise relay_unavailable()
     raise ApiError(
         code,
         message,
         status_code=response.status_code,
-        retryable=retryable,
-        details=details,
     )
 
 
@@ -80,6 +97,25 @@ class RelayClient:
             )
         )
         require_relay_success(response, {202})
+
+    async def ready_epoch(self) -> str:
+        response = await self.receive(
+            self.client.get(
+                f"{self.base_url}/health/ready",
+                timeout=2.0,
+            )
+        )
+        try:
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body, dict) or body.get("status") != "ready":
+                raise ValueError("Relay is not ready")
+            epoch = response.headers.get("X-Scenario-Epoch")
+            if not isinstance(epoch, str) or not epoch:
+                raise ValueError("Relay readiness epoch is missing")
+            return epoch
+        except httpx.HTTPError, TypeError, ValueError:
+            raise relay_unavailable() from None
 
     async def create_subscription(
         self,
